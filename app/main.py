@@ -12,7 +12,7 @@ from app.session_manager import SessionManager
 async def main() -> None:
     settings = load_settings()
     bot = Bot(token=settings.bot_token)
-    session_manager = SessionManager()
+    session_manager = SessionManager(default_workdir=settings.workdir)
     dp = build_dispatcher(settings, session_manager)
 
     await dp.start_polling(bot)

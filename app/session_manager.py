@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import secrets
+from pathlib import Path
 from typing import Dict
 
 from app.models import Session
 
 
 class SessionManager:
-    def __init__(self) -> None:
+    def __init__(self, default_workdir: Path) -> None:
         self.sessions_by_id: Dict[str, Session] = {}
         self.active_session_by_user: Dict[int, str] = {}
+        self.default_workdir = default_workdir.resolve()
+        self.current_workdir_by_user: Dict[int, Path] = {}
 
     def create_session(self, telegram_user_id: int, chat_id: int, command: str) -> Session:
         if telegram_user_id in self.active_session_by_user:
@@ -39,3 +42,9 @@ class SessionManager:
         session.tail_lines.extend(lines)
         if len(session.tail_lines) > max_tail_lines:
             session.tail_lines[:] = session.tail_lines[-max_tail_lines:]
+
+    def get_current_workdir(self, telegram_user_id: int) -> Path:
+        return self.current_workdir_by_user.get(telegram_user_id, self.default_workdir)
+
+    def set_current_workdir(self, telegram_user_id: int, workdir: Path) -> None:
+        self.current_workdir_by_user[telegram_user_id] = workdir.resolve()
