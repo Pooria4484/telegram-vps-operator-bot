@@ -2,16 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime
 from html import escape
+import hashlib
 from pathlib import Path
 
-from aiogram import Dispatcher
+from aiogram import Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.auth import is_allowed
 from app.command_runner import run_command
 from app.config import Settings
-from app.session_manager import SessionManager
+from app.session_manager import PendingUpload, SessionManager
 
 
 def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
@@ -20,6 +21,39 @@ def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
     if expanded.is_absolute():
         return expanded.resolve()
     return (current_dir / expanded).resolve()
+
+
+def resolve_user_path(raw_path: str, current_dir: Path) -> Path:
+    expanded = Path(raw_path.strip()).expanduser()
+    if expanded.is_absolute():
+        return expanded.resolve()
+    return (current_dir / expanded).resolve()
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+async def save_telegram_file(message: Message, file_id: str, target_path: Path) -> None:
+    telegram_file = await message.bot.get_file(file_id)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with target_path.open("wb") as out:
+        await message.bot.download_file(telegram_file.file_path, destination=out)
+
+
+def upload_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Overwrite", callback_data="upload_overwrite"),
+                InlineKeyboardButton(text="Cancel", callback_data="upload_cancel"),
+            ]
+        ]
+    )
 
 
 def format_session_result(
@@ -65,8 +99,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "Commands:\n"
             "/id\n"
             "/run <command>\n"
+            "/get <path>\n"
             "/status\n"
             "/tail\n\n"
+            "Upload behavior:\n"
+            "- send a file directly\n"
+            "- it will be saved in your current dir\n\n"
             f"Current dir: {current_dir}"
         )
 
@@ -118,6 +156,176 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         text = "\n".join(session.tail_lines[-settings.max_tail_lines :])
         await message.answer(text)
+
+    @dp.message(Command("get"))
+    async def get_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await message.answer("Usage: /get <path>")
+            return
+
+        current_dir = session_manager.get_current_workdir(user.id)
+        raw_path = parts[1].strip()
+        target_path = resolve_user_path(raw_path, current_dir)
+
+        if not target_path.exists():
+            await message.answer(
+                f"<b>Get failed</b>\n"
+                f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
+                f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
+                f"<b>Reason:</b> <code>path does not exist</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        if not target_path.is_file():
+            await message.answer(
+                f"<b>Get failed</b>\n"
+                f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
+                f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
+                f"<b>Reason:</b> <code>path is not a file</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            file_size = target_path.stat().st_size
+            file_sha256 = sha256_file(target_path)
+            file_to_send = FSInputFile(str(target_path))
+            await message.answer_document(
+                file_to_send,
+                caption=(
+                    f"<b>File sent</b>\n"
+                    f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
+                    f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
+                    f"<b>Size:</b> <code>{file_size}</code>\n"
+                    f"<b>SHA256:</b> <code>{file_sha256}</code>"
+                ),
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(
+                f"<b>Get failed</b>\n"
+                f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
+                f"<b>Error:</b> <code>{escape(str(exc))}</code>",
+                parse_mode="HTML",
+            )
+
+    @dp.message(F.document)
+    async def upload_document_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        document = message.document
+        if not document or not document.file_name:
+            await message.answer("Upload failed: missing file name.")
+            return
+
+        current_dir = session_manager.get_current_workdir(user.id)
+        target_path = (current_dir / document.file_name).resolve()
+
+        if target_path.exists():
+            session_manager.set_pending_upload(
+                PendingUpload(
+                    telegram_user_id=user.id,
+                    chat_id=message.chat.id,
+                    file_id=document.file_id,
+                    file_name=document.file_name,
+                    target_path=target_path,
+                )
+            )
+            await message.answer(
+                f"<b>File already exists</b>\n"
+                f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
+                f"<b>Action:</b> <code>overwrite?</code>",
+                parse_mode="HTML",
+                reply_markup=upload_confirm_keyboard(),
+            )
+            return
+
+        try:
+            await save_telegram_file(message, document.file_id, target_path)
+            file_sha256 = sha256_file(target_path)
+            await message.answer(
+                f"<b>Uploaded</b>\n"
+                f"<b>SHA256:</b> <code>{file_sha256}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            await message.answer(
+                f"<b>Upload failed</b>\n"
+                f"<b>Error:</b> <code>{escape(str(exc))}</code>",
+                parse_mode="HTML",
+            )
+
+    @dp.callback_query(F.data == "upload_cancel")
+    async def upload_cancel_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        pending = session_manager.get_pending_upload(user.id)
+        session_manager.clear_pending_upload(user.id)
+
+        if callback.message:
+            text = "<b>Upload cancelled</b>"
+            if pending:
+                text += f"\n<b>Path:</b> <code>{escape(str(pending.target_path))}</code>"
+            await callback.message.edit_text(text, parse_mode="HTML")
+
+        await callback.answer("Cancelled")
+
+    @dp.callback_query(F.data == "upload_overwrite")
+    async def upload_overwrite_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        pending = session_manager.get_pending_upload(user.id)
+        if not pending:
+            await callback.answer("No pending upload", show_alert=False)
+            if callback.message:
+                await callback.message.edit_text("<b>No pending upload</b>", parse_mode="HTML")
+            return
+
+        if callback.message:
+            await callback.message.edit_text(
+                f"<b>Overwriting</b>\n"
+                f"<b>Path:</b> <code>{escape(str(pending.target_path))}</code>",
+                parse_mode="HTML",
+            )
+
+        try:
+            telegram_file = await callback.bot.get_file(pending.file_id)
+            pending.target_path.parent.mkdir(parents=True, exist_ok=True)
+            with pending.target_path.open("wb") as out:
+                await callback.bot.download_file(telegram_file.file_path, destination=out)
+
+            file_sha256 = sha256_file(pending.target_path)
+
+            if callback.message:
+                await callback.message.edit_text(
+                    f"<b>Uploaded</b>\n"
+                    f"<b>SHA256:</b> <code>{file_sha256}</code>",
+                    parse_mode="HTML",
+                )
+            await callback.answer("Overwritten")
+        except Exception as exc:
+            if callback.message:
+                await callback.message.edit_text(
+                    f"<b>Upload failed</b>\n"
+                    f"<b>Error:</b> <code>{escape(str(exc))}</code>",
+                    parse_mode="HTML",
+                )
+            await callback.answer("Failed", show_alert=False)
+        finally:
+            session_manager.clear_pending_upload(user.id)
 
     @dp.message(Command("run"))
     async def run_handler(message: Message) -> None:

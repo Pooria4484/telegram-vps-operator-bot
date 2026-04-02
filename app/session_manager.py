@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import secrets
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 
 from app.models import Session
+
+
+@dataclass(slots=True)
+class PendingUpload:
+    telegram_user_id: int
+    chat_id: int
+    file_id: str
+    file_name: str
+    target_path: Path
 
 
 class SessionManager:
@@ -13,6 +23,7 @@ class SessionManager:
         self.active_session_by_user: Dict[int, str] = {}
         self.default_workdir = default_workdir.resolve()
         self.current_workdir_by_user: Dict[int, Path] = {}
+        self.pending_upload_by_user: Dict[int, PendingUpload] = {}
 
     def create_session(self, telegram_user_id: int, chat_id: int, command: str) -> Session:
         if telegram_user_id in self.active_session_by_user:
@@ -48,3 +59,12 @@ class SessionManager:
 
     def set_current_workdir(self, telegram_user_id: int, workdir: Path) -> None:
         self.current_workdir_by_user[telegram_user_id] = workdir.resolve()
+
+    def set_pending_upload(self, pending: PendingUpload) -> None:
+        self.pending_upload_by_user[pending.telegram_user_id] = pending
+
+    def get_pending_upload(self, telegram_user_id: int) -> PendingUpload | None:
+        return self.pending_upload_by_user.get(telegram_user_id)
+
+    def clear_pending_upload(self, telegram_user_id: int) -> None:
+        self.pending_upload_by_user.pop(telegram_user_id, None)
