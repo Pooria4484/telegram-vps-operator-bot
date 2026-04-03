@@ -24,6 +24,7 @@ class SessionManager:
         self.default_workdir = default_workdir.resolve()
         self.current_workdir_by_user: Dict[int, Path] = {}
         self.pending_upload_by_user: Dict[int, PendingUpload] = {}
+        self.stream_enabled_by_user: Dict[int, bool] = {}
 
     def create_session(self, telegram_user_id: int, chat_id: int, command: str) -> Session:
         if telegram_user_id in self.active_session_by_user:
@@ -54,6 +55,29 @@ class SessionManager:
         if len(session.tail_lines) > max_tail_lines:
             session.tail_lines[:] = session.tail_lines[-max_tail_lines:]
 
+    def append_output_text(self, session: Session, text: str, max_tail_lines: int) -> None:
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        data = session.tail_partial + normalized
+        parts = data.split("\n")
+
+        if data.endswith("\n"):
+            complete_lines = parts[:-1]
+            session.tail_partial = ""
+        else:
+            complete_lines = parts[:-1]
+            session.tail_partial = parts[-1]
+
+        if complete_lines:
+            self.append_tail(session, complete_lines, max_tail_lines)
+
+    def get_tail_snapshot(self, session: Session, max_tail_lines: int) -> list[str]:
+        lines = list(session.tail_lines[-max_tail_lines:])
+        if session.tail_partial:
+            lines.append(session.tail_partial)
+        if len(lines) > max_tail_lines:
+            return lines[-max_tail_lines:]
+        return lines
+
     def get_current_workdir(self, telegram_user_id: int) -> Path:
         return self.current_workdir_by_user.get(telegram_user_id, self.default_workdir)
 
@@ -68,3 +92,9 @@ class SessionManager:
 
     def clear_pending_upload(self, telegram_user_id: int) -> None:
         self.pending_upload_by_user.pop(telegram_user_id, None)
+
+    def is_stream_enabled(self, telegram_user_id: int) -> bool:
+        return self.stream_enabled_by_user.get(telegram_user_id, False)
+
+    def set_stream_enabled(self, telegram_user_id: int, enabled: bool) -> None:
+        self.stream_enabled_by_user[telegram_user_id] = enabled

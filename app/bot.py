@@ -1,18 +1,35 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import datetime
 from html import escape
 import hashlib
+import os
 from pathlib import Path
+import re
 
-from aiogram import Dispatcher, F
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 
 from app.auth import is_allowed
-from app.command_runner import run_command
+from app.command_runner import send_ctrl_c, send_pty_input, start_live_command, stop_live_command
 from app.config import Settings
+from app.models import Session
 from app.session_manager import PendingUpload, SessionManager
+
+SESSION_CONTROL_PREFIX = "sessctl"
+SESSION_STREAM_INTERVAL_SECONDS = 2.0
+SESSION_STREAM_MAX_LINES = 20
 
 
 def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
@@ -56,6 +73,129 @@ def upload_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def persistent_control_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="/status"), KeyboardButton(text="/tail"), KeyboardButton(text="/stop")],
+            [KeyboardButton(text="/ctrl c"), KeyboardButton(text="/ctrl d"), KeyboardButton(text="/n")],
+            [KeyboardButton(text="/stream status"), KeyboardButton(text="/stream toggle")],
+            [KeyboardButton(text="/stream on"), KeyboardButton(text="/stream off")],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def session_control_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Stop", callback_data=f"{SESSION_CONTROL_PREFIX}:stop:{session_id}"),
+                InlineKeyboardButton(text="Ctrl+C", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_c:{session_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Ctrl+D", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_d:{session_id}"),
+                InlineKeyboardButton(text="Enter", callback_data=f"{SESSION_CONTROL_PREFIX}:enter:{session_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Tail", callback_data=f"{SESSION_CONTROL_PREFIX}:tail:{session_id}"),
+                InlineKeyboardButton(text="Status", callback_data=f"{SESSION_CONTROL_PREFIX}:status:{session_id}"),
+                InlineKeyboardButton(text="Stream", callback_data=f"{SESSION_CONTROL_PREFIX}:stream_toggle:{session_id}"),
+            ],
+        ]
+    )
+
+
+def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
+    if not data:
+        return None
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return None
+
+    prefix, action, session_id = parts
+    if prefix != SESSION_CONTROL_PREFIX:
+        return None
+
+    if action not in {"stop", "ctrl_c", "ctrl_d", "enter", "tail", "status", "stream_toggle"}:
+        return None
+
+    if not session_id:
+        return None
+
+    return action, session_id
+
+
+def format_session_header(session_id: str, state: str) -> str:
+    safe_session_id = escape(session_id)
+    safe_state = escape(state)
+    return f"<b>Session</b> <code>{safe_session_id}</code> | <b>State</b> <code>{safe_state}</code>"
+
+
+def render_output_lines(output: str) -> str:
+    lines = (output or "[no output]").splitlines() or ["[no output]"]
+    rendered: list[str] = []
+    for line in lines:
+        if not line:
+            rendered.append("<code> </code>")
+            continue
+
+        parts = [part for part in re.split(r"\s+", line.strip()) if part]
+        if not parts:
+            rendered.append("<code> </code>")
+            continue
+
+        rendered.append(" ".join(f"<code>{escape(part)}</code>" for part in parts))
+    return "\n".join(rendered)
+
+
+async def answer_no_active_session(message: Message, current_dir: Path) -> None:
+    await message.answer(
+        f"<b>No active session</b>\n"
+        f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>",
+        parse_mode="HTML",
+        reply_markup=persistent_control_keyboard(),
+    )
+
+
+async def answer_active_session_exists(message: Message, session_id: str) -> None:
+    await message.answer(
+        f"<b>You already have an active session</b>\n"
+        f"<b>Session:</b> <code>{escape(session_id)}</code>\n"
+        f"<b>How to continue:</b> send plain text (example: <code>ls</code>)\n"
+        f"<b>Controls:</b> <code>/n</code>, <code>/ctrl c</code>, <code>/ctrl d</code>, <code>/tail</code>, "
+        f"<code>/status</code>, <code>/stop</code>\n"
+        f"<b>Stream toggle:</b> <code>/stream toggle</code> (or on/off)",
+        parse_mode="HTML",
+        reply_markup=persistent_control_keyboard(),
+    )
+
+
+def format_live_start_message(
+    session_id: str,
+    state: str,
+    pid: int,
+    cwd: str,
+    command: str,
+    stream_enabled: bool,
+) -> str:
+    stream_mode = "on" if stream_enabled else "off"
+    return (
+        f"<b>Live Session Started</b>\n"
+        f"{format_session_header(session_id, state)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"<b>PID:</b> <code>{pid}</code>\n"
+        f"<b>Current dir:</b> <code>{escape(cwd)}</code>\n"
+        f"<b>Command:</b> <code>{escape(command)}</code>\n"
+        f"<b>Stream mode:</b> <code>{stream_mode}</code> "
+        f"(toggle with <code>/stream toggle</code>)\n"
+        f"<b>Interactive:</b> send plain text to active session (example: <code>ls</code>)\n"
+        f"<b>Tip:</b> use <code>/tail</code>, <code>/status</code>, <code>/stop</code>, "
+        f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/stream status</code>"
+    )
+
+
 def format_session_result(
     session_id: str,
     state: str,
@@ -63,25 +203,186 @@ def format_session_result(
     cwd: str,
     output: str,
 ) -> str:
-    safe_session_id = escape(session_id)
-    safe_state = escape(state)
     safe_exit = escape(str(exit_code))
     safe_cwd = escape(cwd)
-
-    lines = (output or "[no output]").splitlines() or ["[no output]"]
-    rendered_lines = "\n".join(
-        f"<code>{escape(line) if line else ' '}</code>" for line in lines
-    )
+    rendered_lines = render_output_lines(output)
 
     return (
-        f"<b>Session</b> <code>{safe_session_id}</code>\n"
-        f"<b>State:</b> <code>{safe_state}</code>\n"
+        f"{format_session_header(session_id, state)}\n"
+        f"━━━━━━━━━━━━━━\n"
         f"<b>Exit code:</b> <code>{safe_exit}</code>\n"
         f"<b>Current dir:</b> <code>{safe_cwd}</code>\n"
-        f"━━━━━━━━━━━━━━\n"
         f"<b>Output</b>\n"
         f"{rendered_lines}"
     )
+
+
+def format_session_status_message(session: Session, current_dir: Path, stream_enabled: bool) -> str:
+    runtime = datetime.utcnow() - session.started_at
+    pid = session.process.pid if session.process else "n/a"
+    stream_mode = "on" if stream_enabled else "off"
+    return (
+        f"{format_session_header(session.session_id, session.state)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"<b>Command:</b> <code>{escape(session.command)}</code>\n"
+        f"<b>PID:</b> <code>{escape(str(pid))}</code>\n"
+        f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
+        f"<b>Runtime:</b> <code>{escape(str(runtime).split('.')[0])}</code>\n"
+        f"<b>Stream mode:</b> <code>{stream_mode}</code>\n"
+        f"<b>Exit code:</b> <code>{escape(str(session.exit_code))}</code>"
+    )
+
+
+def format_tail_message(session: Session, tail_lines: list[str]) -> str:
+    if not tail_lines:
+        return (
+            f"{format_session_header(session.session_id, session.state)}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"<b>Tail</b>\n"
+            f"<code>[no output]</code>"
+        )
+
+    text = "\n".join(tail_lines)
+    return (
+        f"{format_session_header(session.session_id, session.state)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"<b>Tail</b>\n"
+        f"{render_output_lines(text)}"
+    )
+
+
+async def read_session_output(
+    session: Session,
+    session_manager: SessionManager,
+    max_tail_lines: int,
+) -> None:
+    master_fd = session.pty_master_fd
+    if master_fd is None:
+        return
+
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+
+    def on_readable() -> None:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            chunk = b""
+
+        if not chunk:
+            with contextlib.suppress(Exception):
+                loop.remove_reader(master_fd)
+            queue.put_nowait(None)
+            return
+
+        queue.put_nowait(chunk)
+
+    loop.add_reader(master_fd, on_readable)
+    try:
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            session_manager.append_output_text(
+                session,
+                chunk.decode(errors="replace"),
+                max_tail_lines,
+            )
+    finally:
+        with contextlib.suppress(Exception):
+            loop.remove_reader(master_fd)
+        with contextlib.suppress(OSError):
+            os.close(master_fd)
+        session.pty_master_fd = None
+
+
+async def stream_session_output(
+    session: Session,
+    session_manager: SessionManager,
+    settings: Settings,
+    bot: Bot,
+) -> None:
+    while True:
+        await asyncio.sleep(SESSION_STREAM_INTERVAL_SECONDS)
+
+        process = session.process
+        if process is None:
+            break
+
+        if not session_manager.is_stream_enabled(session.telegram_user_id):
+            continue
+
+        tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+        if not tail_lines:
+            continue
+
+        snapshot_lines = tail_lines[-SESSION_STREAM_MAX_LINES:]
+        snapshot_text = "\n".join(snapshot_lines)
+        if snapshot_text == session.stream_last_sent_text:
+            continue
+
+        session.stream_last_sent_text = snapshot_text
+        stream_message = (
+            f"{format_session_header(session.session_id, session.state)}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"<b>Live stream</b>\n"
+            f"{render_output_lines(snapshot_text)}"
+        )
+
+        with contextlib.suppress(Exception):
+            await bot.send_message(session.chat_id, stream_message, parse_mode="HTML")
+
+
+async def wait_session_exit(
+    session: Session,
+    session_manager: SessionManager,
+    settings: Settings,
+    bot: Bot,
+) -> None:
+    process = session.process
+    if process is None:
+        return
+
+    try:
+        exit_code = await process.wait()
+        session.exit_code = exit_code
+        session.state = "stopped" if session.stop_requested else ("finished" if exit_code == 0 else "failed")
+        session.ended_at = datetime.utcnow()
+    except Exception as exc:
+        session.state = "failed"
+        session.ended_at = datetime.utcnow()
+        session_manager.append_output_text(
+            session,
+            f"ERROR: {exc!r}\n",
+            settings.max_tail_lines,
+        )
+    finally:
+        streamer_task = session.streamer_task
+        if streamer_task:
+            streamer_task.cancel()
+            with contextlib.suppress(Exception):
+                await streamer_task
+            session.streamer_task = None
+        if session.reader_task:
+            with contextlib.suppress(Exception):
+                await session.reader_task
+        session_manager.finish_session(session)
+        session.process = None
+        session.waiter_task = None
+
+    current_dir = session_manager.get_current_workdir(session.telegram_user_id)
+    tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+    tail_text = "\n".join(tail_lines) if tail_lines else "[no output]"
+    final_text = format_session_result(
+        session_id=session.session_id,
+        state=session.state,
+        exit_code=session.exit_code,
+        cwd=str(current_dir),
+        output=tail_text,
+    )
+
+    with contextlib.suppress(Exception):
+        await bot.send_message(session.chat_id, final_text, parse_mode="HTML")
 
 
 def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dispatcher:
@@ -99,13 +400,18 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "Commands:\n"
             "/id\n"
             "/run <command>\n"
+            "/stop\n"
+            "/ctrl <c|d>\n"
+            "/n\n"
+            "/stream <on|off|toggle|status> (alias: /live)\n"
             "/get <path>\n"
             "/status\n"
             "/tail\n\n"
             "Upload behavior:\n"
             "- send a file directly\n"
             "- it will be saved in your current dir\n\n"
-            f"Current dir: {current_dir}"
+            f"Current dir: {current_dir}",
+            reply_markup=persistent_control_keyboard(),
         )
 
     @dp.message(Command("id"))
@@ -125,17 +431,13 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         current_dir = session_manager.get_current_workdir(user.id)
         session = session_manager.get_active_session_for_user(user.id)
         if not session:
-            await message.answer(f"No active session.\nCurrent dir: {current_dir}")
+            await answer_no_active_session(message, current_dir)
             return
 
-        runtime = datetime.utcnow() - session.started_at
+        stream_enabled = session_manager.is_stream_enabled(user.id)
         await message.answer(
-            f"Session: {session.session_id}\n"
-            f"State: {session.state}\n"
-            f"Command: {session.command}\n"
-            f"Current dir: {current_dir}\n"
-            f"Runtime: {str(runtime).split('.')[0]}\n"
-            f"Exit code: {session.exit_code}"
+            format_session_status_message(session, current_dir, stream_enabled),
+            parse_mode="HTML",
         )
 
     @dp.message(Command("tail"))
@@ -147,15 +449,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         current_dir = session_manager.get_current_workdir(user.id)
         session = session_manager.get_active_session_for_user(user.id)
         if not session:
-            await message.answer(f"No active session.\nCurrent dir: {current_dir}")
+            await answer_no_active_session(message, current_dir)
             return
 
-        if not session.tail_lines:
-            await message.answer("[no output]")
-            return
-
-        text = "\n".join(session.tail_lines[-settings.max_tail_lines :])
-        await message.answer(text)
+        tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+        await message.answer(format_tail_message(session, tail_lines), parse_mode="HTML")
 
     @dp.message(Command("get"))
     async def get_handler(message: Message) -> None:
@@ -327,6 +625,227 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         finally:
             session_manager.clear_pending_upload(user.id)
 
+    @dp.callback_query(F.data.startswith(f"{SESSION_CONTROL_PREFIX}:"))
+    async def session_control_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        parsed = parse_session_control_callback(callback.data)
+        if not parsed:
+            await callback.answer("Invalid control.", show_alert=False)
+            return
+
+        action, target_session_id = parsed
+        current_dir = session_manager.get_current_workdir(user.id)
+        session = session_manager.get_active_session_for_user(user.id)
+        if not session:
+            await callback.answer("No active session.", show_alert=False)
+            return
+
+        if session.session_id != target_session_id:
+            await callback.answer("Stale control message.", show_alert=False)
+            return
+
+        if action == "status":
+            if callback.message:
+                await callback.message.answer(
+                    format_session_status_message(
+                        session,
+                        current_dir,
+                        session_manager.is_stream_enabled(user.id),
+                    ),
+                    parse_mode="HTML",
+                )
+            await callback.answer("Status sent.", show_alert=False)
+            return
+
+        if action == "tail":
+            if callback.message:
+                tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+                await callback.message.answer(
+                    format_tail_message(session, tail_lines),
+                    parse_mode="HTML",
+                )
+            await callback.answer("Tail sent.", show_alert=False)
+            return
+
+        if action == "stream_toggle":
+            enabled = not session_manager.is_stream_enabled(user.id)
+            session_manager.set_stream_enabled(user.id, enabled)
+            if enabled:
+                session.stream_last_sent_text = ""
+            mode_text = "on" if enabled else "off"
+            await callback.answer(f"Stream mode: {mode_text}", show_alert=False)
+            return
+
+        if action == "stop":
+            process = session.process
+            if process is None:
+                await callback.answer("No live process.", show_alert=False)
+                return
+
+            if session.stop_requested:
+                await callback.answer("Stop already requested.", show_alert=False)
+                return
+
+            session.stop_requested = True
+            await callback.answer("Stop requested.", show_alert=False)
+            await stop_live_command(process)
+            return
+
+        if action == "ctrl_c":
+            process = session.process
+            if process is None:
+                await callback.answer("No live process.", show_alert=False)
+                return
+
+            if not send_ctrl_c(process):
+                await callback.answer("Process is no longer running.", show_alert=False)
+                return
+
+            await callback.answer("Sent Ctrl+C.", show_alert=False)
+            return
+
+        master_fd = session.pty_master_fd
+        if master_fd is None:
+            await callback.answer("No active PTY.", show_alert=False)
+            return
+
+        payload = b"\x04" if action == "ctrl_d" else b"\n"
+        action_name = "Ctrl+D" if action == "ctrl_d" else "Enter"
+        if not send_pty_input(master_fd, payload):
+            await callback.answer("PTY is no longer available.", show_alert=False)
+            return
+
+        await callback.answer(f"Sent {action_name}.", show_alert=False)
+
+    @dp.message(Command("stop"))
+    async def stop_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        current_dir = session_manager.get_current_workdir(user.id)
+        session = session_manager.get_active_session_for_user(user.id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        process = session.process
+        if process is None:
+            await message.answer("No live process is attached to the active session.")
+            return
+
+        if session.stop_requested:
+            await message.answer("Stop is already requested for this session.")
+            return
+
+        session.stop_requested = True
+        await message.answer(f"Stop requested for session {session.session_id}.")
+        await stop_live_command(process)
+
+    @dp.message(Command("ctrl"))
+    async def ctrl_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("Usage: /ctrl <c|d>")
+            return
+
+        action = parts[1].strip().lower()
+        if action not in {"c", "d"}:
+            await message.answer("Usage: /ctrl <c|d>")
+            return
+
+        current_dir = session_manager.get_current_workdir(user.id)
+        session = session_manager.get_active_session_for_user(user.id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        if action == "c":
+            process = session.process
+            if process is None:
+                await message.answer("No live process is attached to the active session.")
+                return
+
+            if not send_ctrl_c(process):
+                await message.answer("Could not send Ctrl+C. Process is no longer running.")
+                return
+
+            await message.answer(f"Sent Ctrl+C to session {session.session_id}.")
+            return
+
+        master_fd = session.pty_master_fd
+        if master_fd is None:
+            await message.answer("No active PTY is attached to the session.")
+            return
+
+        if not send_pty_input(master_fd, b"\x04"):
+            await message.answer("Could not send Ctrl+D. PTY is no longer available.")
+            return
+
+        await message.answer(f"Sent Ctrl+D (EOF) to session {session.session_id}.")
+
+    @dp.message(Command("n"))
+    async def newline_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        current_dir = session_manager.get_current_workdir(user.id)
+        session = session_manager.get_active_session_for_user(user.id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        master_fd = session.pty_master_fd
+        if master_fd is None:
+            await message.answer("No active PTY is attached to the session.")
+            return
+
+        if not send_pty_input(master_fd, b"\n"):
+            await message.answer("Could not send Enter. PTY is no longer available.")
+            return
+
+        await message.answer(f"Sent Enter to session {session.session_id}.")
+
+    @dp.message(Command(commands=["stream", "live"]))
+    async def stream_mode_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        mode = parts[1].strip().lower() if len(parts) >= 2 else "status"
+        if mode not in {"on", "off", "toggle", "status"}:
+            await message.answer("Usage: /stream <on|off|toggle|status> (alias: /live)")
+            return
+
+        if mode == "status":
+            enabled = session_manager.is_stream_enabled(user.id)
+            state_text = "on" if enabled else "off"
+            await message.answer(f"Stream mode: <code>{state_text}</code>", parse_mode="HTML")
+            return
+
+        if mode == "toggle":
+            enabled = not session_manager.is_stream_enabled(user.id)
+        else:
+            enabled = mode == "on"
+        session_manager.set_stream_enabled(user.id, enabled)
+        if enabled:
+            session = session_manager.get_active_session_for_user(user.id)
+            if session:
+                session.stream_last_sent_text = ""
+        state_text = "enabled" if enabled else "disabled"
+        await message.answer(f"Stream mode {state_text}.", parse_mode="HTML")
+
     @dp.message(Command("run"))
     async def run_handler(message: Message) -> None:
         user = message.from_user
@@ -378,7 +897,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         active = session_manager.get_active_session_for_user(user.id)
         if active:
-            await message.answer("You already have an active session.")
+            await answer_active_session_exists(message, active.session_id)
             return
 
         session = session_manager.create_session(
@@ -386,52 +905,86 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             chat_id=message.chat.id,
             command=command,
         )
-
-        await message.answer(
-            f"<b>Started session</b> <code>{escape(session.session_id)}</code>\n"
-            f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
-            f"<b>Command:</b> <code>{escape(command)}</code>",
-            parse_mode="HTML",
-        )
-        session.state = "running"
-
         try:
-            result = await run_command(
+            live = await start_live_command(
                 command=command,
                 shell=settings.default_shell,
                 cwd=current_dir,
             )
-            output_lines: list[str] = []
-            if result.stdout.strip():
-                output_lines.extend(result.stdout.splitlines())
-            if result.stderr.strip():
-                output_lines.extend(result.stderr.splitlines())
-
-            session_manager.append_tail(session, output_lines, settings.max_tail_lines)
-            session.exit_code = result.exit_code
-            session.state = "finished" if result.exit_code == 0 else "failed"
         except Exception as exc:
-            session_manager.append_tail(
+            session.state = "failed"
+            session.ended_at = datetime.utcnow()
+            session_manager.append_output_text(
                 session,
-                [f"ERROR: {exc!r}"],
+                f"ERROR: {exc!r}\n",
                 settings.max_tail_lines,
             )
-            session.state = "failed"
-        finally:
-            session.ended_at = datetime.utcnow()
             session_manager.finish_session(session)
 
-        tail_text = "\n".join(session.tail_lines) if session.tail_lines else "[no output]"
-        current_dir = session_manager.get_current_workdir(user.id)
-        final_text = format_session_result(
-            session_id=session.session_id,
-            state=session.state,
-            exit_code=session.exit_code,
-            cwd=str(current_dir),
-            output=tail_text,
+            tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+            tail_text = "\n".join(tail_lines) if tail_lines else "[no output]"
+            final_text = format_session_result(
+                session_id=session.session_id,
+                state=session.state,
+                exit_code=session.exit_code,
+                cwd=str(current_dir),
+                output=tail_text,
+            )
+            await message.answer(final_text, parse_mode="HTML")
+            return
+
+        session.state = "running"
+        session.process = live.process
+        session.pty_master_fd = live.pty_master_fd
+        session.stream_last_sent_text = ""
+        session.reader_task = asyncio.create_task(
+            read_session_output(session, session_manager, settings.max_tail_lines)
+        )
+        session.streamer_task = asyncio.create_task(
+            stream_session_output(session, session_manager, settings, message.bot)
+        )
+        session.waiter_task = asyncio.create_task(
+            wait_session_exit(session, session_manager, settings, message.bot)
         )
 
-        print("FINAL TEXT TO SEND:", repr(final_text))
-        await message.answer(final_text, parse_mode="HTML")
+        await message.answer(
+            format_live_start_message(
+                session_id=session.session_id,
+                state=session.state,
+                pid=live.process.pid,
+                cwd=str(current_dir),
+                command=command,
+                stream_enabled=session_manager.is_stream_enabled(user.id),
+            ),
+            parse_mode="HTML",
+            reply_markup=session_control_keyboard(session.session_id),
+        )
+        await message.answer(
+            "Persistent controls are available on your keyboard.",
+            reply_markup=persistent_control_keyboard(),
+        )
+
+    @dp.message(F.text & ~F.text.startswith("/"))
+    async def interactive_text_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        session = session_manager.get_active_session_for_user(user.id)
+        if not session:
+            return
+
+        master_fd = session.pty_master_fd
+        if master_fd is None:
+            await message.answer("No active PTY is attached to the session.")
+            return
+
+        text = message.text or ""
+        if not text:
+            return
+
+        data = text.encode(errors="replace") + b"\n"
+        if not send_pty_input(master_fd, data):
+            await message.answer("Could not send text to active session.")
 
     return dp

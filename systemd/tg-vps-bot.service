@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram VPS Bot
+After=network.target
+
+[Service]
+Type=simple
+User=pooria
+Group=pooria
+WorkingDirectory=/home/pooria/tg_vps_bot
+EnvironmentFile=/home/pooria/tg_vps_bot/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/pooria/tg_vps_bot/.venv/bin/python -m app.main
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
