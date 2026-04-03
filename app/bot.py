@@ -76,10 +76,24 @@ def upload_confirm_keyboard() -> InlineKeyboardMarkup:
 def persistent_control_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="/status"), KeyboardButton(text="/tail"), KeyboardButton(text="/stop")],
-            [KeyboardButton(text="/ctrl c"), KeyboardButton(text="/ctrl d"), KeyboardButton(text="/n")],
-            [KeyboardButton(text="/stream status"), KeyboardButton(text="/stream toggle")],
-            [KeyboardButton(text="/stream on"), KeyboardButton(text="/stream off")],
+            [
+                KeyboardButton(text="/status"),
+                KeyboardButton(text="/tail"),
+                KeyboardButton(text="/stop"),
+                KeyboardButton(text="/clear"),
+            ],
+            [
+                KeyboardButton(text="/ctrl c"),
+                KeyboardButton(text="/ctrl d"),
+                KeyboardButton(text="/n"),
+                KeyboardButton(text="/stream toggle"),
+            ],
+            [
+                KeyboardButton(text="/stream status"),
+                KeyboardButton(text="/stream on"),
+                KeyboardButton(text="/stream off"),
+                KeyboardButton(text="/id"),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -92,8 +106,6 @@ def session_control_keyboard(session_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Stop", callback_data=f"{SESSION_CONTROL_PREFIX}:stop:{session_id}"),
                 InlineKeyboardButton(text="Ctrl+C", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_c:{session_id}"),
-            ],
-            [
                 InlineKeyboardButton(text="Ctrl+D", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_d:{session_id}"),
                 InlineKeyboardButton(text="Enter", callback_data=f"{SESSION_CONTROL_PREFIX}:enter:{session_id}"),
             ],
@@ -101,6 +113,7 @@ def session_control_keyboard(session_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Tail", callback_data=f"{SESSION_CONTROL_PREFIX}:tail:{session_id}"),
                 InlineKeyboardButton(text="Status", callback_data=f"{SESSION_CONTROL_PREFIX}:status:{session_id}"),
                 InlineKeyboardButton(text="Stream", callback_data=f"{SESSION_CONTROL_PREFIX}:stream_toggle:{session_id}"),
+                InlineKeyboardButton(text="Clear Output", callback_data=f"{SESSION_CONTROL_PREFIX}:clear:{session_id}"),
             ],
         ]
     )
@@ -118,7 +131,7 @@ def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
     if prefix != SESSION_CONTROL_PREFIX:
         return None
 
-    if action not in {"stop", "ctrl_c", "ctrl_d", "enter", "tail", "status", "stream_toggle"}:
+    if action not in {"stop", "ctrl_c", "ctrl_d", "enter", "tail", "status", "stream_toggle", "clear"}:
         return None
 
     if not session_id:
@@ -165,7 +178,7 @@ async def answer_active_session_exists(message: Message, session_id: str) -> Non
         f"<b>Session:</b> <code>{escape(session_id)}</code>\n"
         f"<b>How to continue:</b> send plain text (example: <code>ls</code>)\n"
         f"<b>Controls:</b> <code>/n</code>, <code>/ctrl c</code>, <code>/ctrl d</code>, <code>/tail</code>, "
-        f"<code>/status</code>, <code>/stop</code>\n"
+        f"<code>/status</code>, <code>/stop</code>, <code>/clear</code>\n"
         f"<b>Stream toggle:</b> <code>/stream toggle</code> (or on/off)",
         parse_mode="HTML",
         reply_markup=persistent_control_keyboard(),
@@ -192,7 +205,7 @@ def format_live_start_message(
         f"(toggle with <code>/stream toggle</code>)\n"
         f"<b>Interactive:</b> send plain text to active session (example: <code>ls</code>)\n"
         f"<b>Tip:</b> use <code>/tail</code>, <code>/status</code>, <code>/stop</code>, "
-        f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/stream status</code>"
+        f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/clear</code>, <code>/stream status</code>"
     )
 
 
@@ -403,6 +416,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "/stop\n"
             "/ctrl <c|d>\n"
             "/n\n"
+            "/clear\n"
             "/stream <on|off|toggle|status> (alias: /live)\n"
             "/get <path>\n"
             "/status\n"
@@ -679,6 +693,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await callback.answer(f"Stream mode: {mode_text}", show_alert=False)
             return
 
+        if action == "clear":
+            session_manager.clear_output_buffer(session)
+            await callback.answer("Output buffer cleared.", show_alert=False)
+            return
+
         if action == "stop":
             process = session.process
             if process is None:
@@ -814,6 +833,24 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         await message.answer(f"Sent Enter to session {session.session_id}.")
+
+    @dp.message(Command("clear"))
+    async def clear_output_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        current_dir = session_manager.get_current_workdir(user.id)
+        session = session_manager.get_active_session_for_user(user.id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        session_manager.clear_output_buffer(session)
+        await message.answer(
+            f"Output buffer cleared for session <code>{escape(session.session_id)}</code>.",
+            parse_mode="HTML",
+        )
 
     @dp.message(Command(commands=["stream", "live"]))
     async def stream_mode_handler(message: Message) -> None:

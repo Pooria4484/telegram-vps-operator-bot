@@ -78,6 +78,11 @@ class SessionManager:
             return lines[-max_tail_lines:]
         return lines
 
+    def clear_output_buffer(self, session: Session) -> None:
+        session.tail_lines.clear()
+        session.tail_partial = ""
+        session.stream_last_sent_text = ""
+
     def get_current_workdir(self, telegram_user_id: int) -> Path:
         return self.current_workdir_by_user.get(telegram_user_id, self.default_workdir)
 

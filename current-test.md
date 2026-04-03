@@ -20,8 +20,9 @@ Stage under test: Phase 5 (Stream control - minimal)
 3. Start interactive shell session
 - send `/run bash`
 - expected: start message includes session id, state, pid, current dir, command
-- expected: inline control keyboard is visible (`Stop`, `Ctrl+C`, `Ctrl+D`, `Enter`, `Tail`, `Status`, `Stream`)
+- expected: inline control keyboard is visible (`Stop`, `Ctrl+C`, `Ctrl+D`, `Enter`, `Tail`, `Status`, `Stream`, `Clear Output`)
 - expected: persistent reply keyboard is visible in chat input area
+- expected: control buttons are arranged in 4-column rows for better UX
 
 4. Active status
 - immediately send `/status`
@@ -79,36 +80,45 @@ Stage under test: Phase 5 (Stream control - minimal)
 - run a command that prints multi-word output (example: `echo \"word1 word2\"`)
 - expected: words are rendered as separate code tokens and each word can be copied independently
 
-18. Send EOF using inline `Ctrl+D`
+18. Clear output buffer via inline button
+- click `Clear Output`
+- expected: output buffer is cleared
+- expected: `Tail` immediately shows `[no output]` until new output arrives
+
+19. Clear output buffer via command
+- send `/clear`
+- expected: output buffer is cleared and confirmation message is returned
+
+20. Send EOF using inline `Ctrl+D`
 - click `Ctrl+D` button
 - expected: shell exits and session ends
 
-19. Final status after exit
+21. Final status after exit
 - send `/status`
 - expected: `No active session` is shown
 
-20. Stale button safety
+22. Stale button safety
 - after session is ended, click an old control button from previous message
 - expected: no command is executed; callback is rejected as stale/no-active
 
-21. Tail during/after interactive run
+23. Tail during/after interactive run
 - send `/tail`
 - expected: no crash; recent output is shown
 
-22. Working directory persistence
+24. Working directory persistence
 - send `/run cd /tmp`
 - send `/status` (with no active session, dir should be shown in no-session message)
 - expected: current dir reflects `/tmp`
 
-23. File get path resolution
+25. File get path resolution
 - send `/run touch test_phase2.txt`
 - send `/get test_phase2.txt`
 - expected: file is sent successfully, path resolved from current dir, SHA256 shown
 
-24. Whitelist protection (negative test)
+26. Whitelist protection (negative test)
 - from non-whitelisted Telegram user, send `/id` or `/run ls`
 - expected: bot does not execute commands for that user
 
 ## Exit Criteria
-- all 24 tests pass
-- no regression in `/run`, `/status`, `/tail`, `/stop`, `/ctrl`, `/n`, `/stream`, inline controls, `/get`, upload flow
+- all 26 tests pass
+- no regression in `/run`, `/status`, `/tail`, `/stop`, `/ctrl`, `/n`, `/clear`, `/stream`, inline controls, `/get`, upload flow

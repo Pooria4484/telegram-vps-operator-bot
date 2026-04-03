@@ -17,11 +17,12 @@ Last update: 2026-04-03
 - `/n` for Enter/newline to active PTY
 - plain text messages are forwarded to active PTY session
 - inline session control buttons are added on run start:
-- `Stop`, `Ctrl+C`, `Ctrl+D`, `Enter`, `Tail`, `Status`, `Stream`
+- `Stop`, `Ctrl+C`, `Ctrl+D`, `Enter`, `Tail`, `Status`, `Stream`, `Clear Output`
 - stale button callbacks are handled safely by session id check
 - `/stream <on|off|toggle|status>` (alias: `/live`) is added
 - when stream mode is on, live output snapshots are pushed automatically
 - persistent reply keyboard keeps controls always available
+- `/clear` command clears active session output buffer
 - output lines are rendered as per-word code tokens for easy copy
 - service runs as `pooria` user
 - per-user working directory behavior preserved
