@@ -27,6 +27,13 @@ class Settings:
     default_shell: str
     workdir: Path
     max_tail_lines: int
+    codex_auth_path: Path
+    codex_bin: str
+    chat_model: str
+    chat_reasoning_effort: str
+    chat_limit_5h_requests: int
+    chat_limit_week_requests: int
+    chat_history_messages: int
 
 
 def load_settings() -> Settings:
@@ -42,4 +49,13 @@ def load_settings() -> Settings:
         default_shell=os.getenv("DEFAULT_SHELL", "/bin/bash").strip(),
         workdir=Path(os.getenv("WORKDIR", str(Path.home()))).expanduser(),
         max_tail_lines=int(os.getenv("MAX_TAIL_LINES", "30")),
+        codex_auth_path=Path(
+            os.getenv("CODEX_AUTH_PATH", str(Path.home() / ".codex" / "auth.json"))
+        ).expanduser(),
+        codex_bin=os.getenv("CODEX_BIN", "codex").strip(),
+        chat_model=os.getenv("CHAT_MODEL", "gpt-5.4").strip(),
+        chat_reasoning_effort=os.getenv("CHAT_REASONING_EFFORT", "medium").strip(),
+        chat_limit_5h_requests=int(os.getenv("CHAT_LIMIT_5H_REQUESTS", "100")),
+        chat_limit_week_requests=int(os.getenv("CHAT_LIMIT_WEEK_REQUESTS", "1000")),
+        chat_history_messages=int(os.getenv("CHAT_HISTORY_MESSAGES", "40")),
     )

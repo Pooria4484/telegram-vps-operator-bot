@@ -1,7 +1,7 @@
 # Current Stage Test Plan
 
 Last update: 2026-04-03
-Stage under test: Phase 5 (Stream control - minimal)
+Stage under test: Phase 5 + Chat mode (special capability #1)
 
 ## Preconditions
 - Bot service is running (`tg-vps-bot.service`)
@@ -119,6 +119,152 @@ Stage under test: Phase 5 (Stream control - minimal)
 - from non-whitelisted Telegram user, send `/id` or `/run ls`
 - expected: bot does not execute commands for that user
 
+27. Enter chat mode
+- send `/chat`
+- expected: chat mode summary is shown with active chat id and usage windows
+- expected: ops keyboard is replaced by chat keyboard (`/chat usage`, `/chat new`, `/chat resume`, `/chat exit`)
+
+28. Chat usage view
+- send `/chat usage`
+- expected: usage for 5-hour and weekly windows plus reset timestamps is shown
+
+29. Chat with model
+- while in chat mode, send plain text like `hello`
+- expected: response from model is returned
+- expected: usage counters increase
+
+30. New chat thread
+- send `/chat new`
+- expected: active chat id changes and starts empty/new thread
+
+31. Resume previous chat
+- send `/chat resume`
+- expected: only chat-mode threads are listed as buttons
+- click one previous chat button
+- expected: selected chat becomes active and is resumed
+
+32. Exit chat mode
+- send `/chat exit`
+- expected: chat mode is disabled and persistent ops keyboard is restored
+
+33. Plain text routing after chat exit
+- with active shell session, send plain text
+- expected: text goes to PTY session (not model chat)
+
+34. Chat mode without Codex auth file (negative test)
+- temporarily move or invalidate `~/.codex/auth.json`, then send `/chat` and plain text
+- expected: clear auth-file error is shown and bot does not crash
+
+35. Chat mode codex binary resolution
+- run bot under service environment where `codex` is not in PATH
+- send `/chat` and plain text
+- expected: bot resolves `codex` from `CODEX_BIN` or `~/.nvm/.../bin/codex` and returns response
+
+36. Chat mode with old system node on PATH
+- run bot where `/usr/bin/node` is old (example v12) and codex installed under `~/.nvm/...`
+- send `/chat` and plain text
+- expected: bot launches codex using sibling nvm `node` and does not fail with `Unexpected reserved word`
+
+37. Interactive session precedence over chat mode
+- enter chat mode with `/chat`
+- start interactive shell with `/run bash`
+- send plain text `pwd`
+- expected: text is forwarded to active PTY session (not Codex chat)
+- expected: `/tail` shows shell output
+
+38. Chat path still works when no active session
+- stop/exit active session
+- while chat mode is enabled, send plain text `hello`
+- expected: message is handled by Codex chat and response is returned
+
+39. Plain text without active route (no silent drop)
+- ensure no active session and chat mode is disabled (`/chat exit`)
+- send plain text `hello`
+- expected: bot responds with guidance to use `/chat` or `/run <command>`
+
+40. `/chat` enter with active session shows routing note
+- start active session with `/run bash`
+- send `/chat`
+- expected: chat summary includes a note that plain text is routed to active shell session until stopped
+
+41. Chat streaming updates in-place
+- send `/chat`
+- send a prompt that takes a few seconds
+- expected: bot sends one progress message (`Codex stream: ...`) and updates the same message while response is generated
+
+42. Chat stream finalize behavior
+- after stream completes, expected: same progress message is replaced by final assistant response + usage summary
+- expected: no silent drop (either edited message or fallback new message appears)
+
+43. Chat heartbeat while waiting
+- send `/chat`
+- send a prompt and wait before first token arrives
+- expected: progress message is periodically updated (`waiting for model response... Ns`)
+
+44. Chat timeout behavior
+- simulate unreachable model endpoint/network issue
+- expected: within 120 seconds progress message is replaced with explicit timeout error
+- expected: no indefinite `Codex stream: ...` hang
+
+45. Codex JSON `item.completed` compatibility
+- run `/chat` and send a short prompt
+- expected: when codex emits `item.completed` (agent_message), bot captures it and posts final answer
+- expected: final answer is not lost even if no token-level delta events were emitted
+
+46. Chat progress edit validation
+- send `/chat` and a prompt
+- expected: progress message is edited without Telegram validation errors
+- expected: no stuck `Codex stream: ...` due invalid reply markup on `edit_text`
+
+47. Chat edit fallback behavior
+- simulate edit failure case (or observe from logs)
+- expected: bot posts a fresh progress/final message instead of staying frozen
+- expected: service log contains a warning for failed edit path
+
+48. Reconnect status visibility
+- trigger a slow/unsteady chat request
+- expected: stream text shows status hints like `Reconnecting...` when codex emits JSON error events
+
+49. Stream callback guard timeout
+- force slow/unstable Telegram edit path while chat is running
+- expected: codex processing still reaches final response or explicit timeout
+- expected: chat does not freeze at an intermediate second counter due blocked UI callback
+
+50. Heartbeat cannot deadlock handler
+- during long chat, observe heartbeat updates crossing 114s and beyond if needed
+- expected: either explicit timeout/final response appears; handler must not remain stuck on a fixed second value
+
+51. Heartbeat preserves reconnect context
+- during reconnect cycles, keep watching waiting message
+- expected: waiting line includes `last status: ...` (for example reconnect attempts) instead of hiding transient codex errors immediately
+
+52. Reconnect fail-fast
+- force reconnect-heavy run with no token output
+- expected: after fail-fast threshold (~75s) bot returns explicit reconnect failure instead of continuing long wait
+
+53. `/run codex` path resolution from login shell env
+- send `/run codex --version`
+- expected: command is recognized without manually exporting PATH inside session
+- expected: one-shot command finishes and returns version output (no hanging live session)
+
+54. `/run zsh` then `codex` availability
+- send `/run zsh`
+- then send plain text `codex --version`
+- expected: codex is found in the interactive shell (matching direct terminal behavior)
+
+55. `/run bash` then `codex` availability
+- send `/run bash`
+- then send plain text `codex --version`
+- expected: codex is still found (PATH inherited from login-shell-derived env)
+
+56. `/tail` plain-text cleanup for terminal escape codes
+- run a command that emits colored/control output
+- expected: `/tail` shows plain text without ANSI fragments like `[39;49m`, `[K`, `?25h`
+
+57. Carriage-return overwrite behavior
+- run a command with progress-style carriage returns
+- expected: tail keeps the latest line state instead of appending noisy partial redraw fragments
+
 ## Exit Criteria
-- all 26 tests pass
-- no regression in `/run`, `/status`, `/tail`, `/stop`, `/ctrl`, `/n`, `/clear`, `/stream`, inline controls, `/get`, upload flow
+- all 57 tests pass
+- no regression in `/run`, `/status`, `/tail`, `/stop`, `/ctrl`, `/n`, `/clear`, `/stream`, `/chat`, inline controls, `/get`, upload flow
