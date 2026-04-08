@@ -20,6 +20,17 @@ def _parse_user_ids(raw: str) -> set[int]:
     return result
 
 
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be > 0")
+    return value
+
+
 @dataclass(slots=True)
 class Settings:
     bot_token: str
@@ -27,6 +38,8 @@ class Settings:
     default_shell: str
     workdir: Path
     max_tail_lines: int
+    max_upload_bytes: int
+    log_level: str
 
 
 def load_settings() -> Settings:
@@ -41,5 +54,7 @@ def load_settings() -> Settings:
         allowed_user_ids=allowed_user_ids,
         default_shell=os.getenv("DEFAULT_SHELL", "/bin/bash").strip(),
         workdir=Path(os.getenv("WORKDIR", str(Path.home()))).expanduser(),
-        max_tail_lines=int(os.getenv("MAX_TAIL_LINES", "30")),
+        max_tail_lines=_parse_positive_int_env("MAX_TAIL_LINES", 30),
+        max_upload_bytes=_parse_positive_int_env("MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
+        log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
     )

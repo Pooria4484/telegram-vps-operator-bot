@@ -5,6 +5,7 @@ import contextlib
 from datetime import datetime
 from html import escape
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
@@ -41,6 +42,7 @@ SESSION_CONTROL_PREFIX = "sessctl"
 CONTEXT_CONTROL_PREFIX = "ctxctl"
 SESSION_STREAM_INTERVAL_SECONDS = 2.0
 SESSION_STREAM_MAX_LINES = 20
+logger = logging.getLogger(__name__)
 
 BTN_STATUS = "Status"
 BTN_TAIL = "Tail"
@@ -84,6 +86,20 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def format_size(num_bytes: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    value = float(num_bytes)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1024 or candidate == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{int(value)} {unit}"
+    return f"{value:.1f} {unit}"
 
 
 def sanitize_uploaded_filename(file_name: str) -> str:
@@ -619,6 +635,14 @@ async def wait_session_exit(
         session.exit_code = exit_code
         session.state = "stopped" if session.stop_requested else ("finished" if exit_code == 0 else "failed")
         session.ended_at = datetime.utcnow()
+        logger.info(
+            "Session exited: user_id=%s session_id=%s state=%s exit_code=%s command=%r",
+            session.telegram_user_id,
+            session.session_id,
+            session.state,
+            session.exit_code,
+            session.command,
+        )
     except Exception as exc:
         session.state = "failed"
         session.ended_at = datetime.utcnow()
@@ -626,6 +650,12 @@ async def wait_session_exit(
             session,
             f"ERROR: {exc!r}\n",
             settings.max_tail_lines,
+        )
+        logger.exception(
+            "Session wait failed: user_id=%s session_id=%s command=%r",
+            session.telegram_user_id,
+            session.session_id,
+            session.command,
         )
     finally:
         # Release active-session lock first, then perform best-effort cleanup.
@@ -717,6 +747,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         session.stop_requested = True
+        logger.info(
+            "Stop requested: user_id=%s session_id=%s command=%r",
+            user_id,
+            session.session_id,
+            session.command,
+        )
         await message.answer(f"Stop requested for session {session.session_id}.")
         await stop_live_command(process)
 
@@ -890,6 +926,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         target_path = resolve_user_path(raw_path, current_dir)
 
         if not target_path.exists():
+            logger.info(
+                "Get failed (missing path): user_id=%s path=%s",
+                user.id,
+                target_path,
+            )
             await message.answer(
                 f"<b>Get failed</b>\n"
                 f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
@@ -901,6 +942,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         if not target_path.is_file():
+            logger.info(
+                "Get failed (not file): user_id=%s path=%s",
+                user.id,
+                target_path,
+            )
             await message.answer(
                 f"<b>Get failed</b>\n"
                 f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
@@ -927,6 +973,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 parse_mode="HTML",
             )
         except Exception as exc:
+            logger.exception(
+                "Get failed with exception: user_id=%s path=%s",
+                user.id,
+                target_path,
+            )
             await message.answer(
                 f"<b>Get failed</b>\n"
                 f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
@@ -944,6 +995,23 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         document = message.document
         if not document or not document.file_name:
             await message.answer("Upload failed: missing file name.")
+            return
+
+        if document.file_size and document.file_size > settings.max_upload_bytes:
+            logger.warning(
+                "Upload rejected (size limit): user_id=%s name=%r size=%s limit=%s",
+                user.id,
+                document.file_name,
+                document.file_size,
+                settings.max_upload_bytes,
+            )
+            await message.answer(
+                f"<b>Upload failed</b>\n"
+                f"<b>Reason:</b> <code>file is too large</code>\n"
+                f"<b>File size:</b> <code>{format_size(document.file_size)}</code>\n"
+                f"<b>Limit:</b> <code>{format_size(settings.max_upload_bytes)}</code>",
+                parse_mode="HTML",
+            )
             return
 
         try:
@@ -978,13 +1046,43 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         try:
             await save_telegram_file(message, document.file_id, target_path)
+            actual_size = target_path.stat().st_size
+            if actual_size > settings.max_upload_bytes:
+                with contextlib.suppress(OSError):
+                    target_path.unlink()
+                logger.warning(
+                    "Upload removed after save (size limit): user_id=%s path=%s size=%s limit=%s",
+                    user.id,
+                    target_path,
+                    actual_size,
+                    settings.max_upload_bytes,
+                )
+                await message.answer(
+                    f"<b>Upload failed</b>\n"
+                    f"<b>Reason:</b> <code>file is too large</code>\n"
+                    f"<b>File size:</b> <code>{format_size(actual_size)}</code>\n"
+                    f"<b>Limit:</b> <code>{format_size(settings.max_upload_bytes)}</code>",
+                    parse_mode="HTML",
+                )
+                return
             file_sha256 = sha256_file(target_path)
+            logger.info(
+                "Upload saved: user_id=%s path=%s size=%s",
+                user.id,
+                target_path,
+                actual_size,
+            )
             await message.answer(
                 f"<b>Uploaded</b>\n"
                 f"<b>SHA256:</b> <code>{file_sha256}</code>",
                 parse_mode="HTML",
             )
         except Exception as exc:
+            logger.exception(
+                "Upload failed with exception: user_id=%s file_name=%r",
+                user.id,
+                document.file_name if document else None,
+            )
             await message.answer(
                 f"<b>Upload failed</b>\n"
                 f"<b>Error:</b> <code>{escape(str(exc))}</code>",
@@ -1179,6 +1277,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 return
 
             session.stop_requested = True
+            logger.info(
+                "Stop requested from inline control: user_id=%s session_id=%s command=%r",
+                user.id,
+                session.session_id,
+                session.command,
+            )
             await callback.answer("Stop requested.", show_alert=False)
             await stop_live_command(process)
             return
@@ -1439,6 +1543,13 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             chat_id=message.chat.id,
             command=command,
         )
+        logger.info(
+            "Starting live session: user_id=%s session_id=%s command=%r cwd=%s",
+            user.id,
+            session.session_id,
+            command,
+            current_dir,
+        )
         try:
             live = await start_live_command(
                 command=command,
@@ -1454,6 +1565,13 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 settings.max_tail_lines,
             )
             session_manager.finish_session(session)
+            logger.exception(
+                "Failed to start live session: user_id=%s session_id=%s command=%r cwd=%s",
+                user.id,
+                session.session_id,
+                command,
+                current_dir,
+            )
 
             tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
             tail_text = "\n".join(tail_lines) if tail_lines else "[no output]"
