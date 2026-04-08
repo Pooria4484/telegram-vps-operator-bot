@@ -39,7 +39,13 @@ class Settings:
     workdir: Path
     max_tail_lines: int
     max_upload_bytes: int
+    max_running_sessions_per_user: int
+    max_session_history_per_user: int
+    sessions_page_size: int
+    detached_session_ttl_seconds: int
+    detached_sweep_interval_seconds: int
     log_level: str
+    session_db_path: Path
 
 
 def load_settings() -> Settings:
@@ -56,5 +62,13 @@ def load_settings() -> Settings:
         workdir=Path(os.getenv("WORKDIR", str(Path.home()))).expanduser(),
         max_tail_lines=_parse_positive_int_env("MAX_TAIL_LINES", 30),
         max_upload_bytes=_parse_positive_int_env("MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
+        max_running_sessions_per_user=_parse_positive_int_env("MAX_RUNNING_SESSIONS_PER_USER", 3),
+        max_session_history_per_user=_parse_positive_int_env("MAX_SESSION_HISTORY_PER_USER", 20),
+        sessions_page_size=_parse_positive_int_env("SESSIONS_PAGE_SIZE", 5),
+        detached_session_ttl_seconds=_parse_positive_int_env("DETACHED_SESSION_TTL_SECONDS", 3600),
+        detached_sweep_interval_seconds=_parse_positive_int_env("DETACHED_SWEEP_INTERVAL_SECONDS", 30),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+        session_db_path=Path(
+            os.getenv("SESSION_DB_PATH", "./session_store.sqlite3")
+        ).expanduser(),
     )

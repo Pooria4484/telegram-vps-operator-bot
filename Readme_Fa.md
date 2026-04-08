@@ -34,9 +34,13 @@
 - `/id` نمایش شناسه تلگرام
 - `/run <command>` اجرای دستور
 - `/run cd <path>` تغییر مسیر کاری فعلی
-- `/status` نمایش وضعیت سشن فعال
-- `/tail` نمایش خروجی اخیر (یا آخرین سشن)
-- `/stop` توقف سشن فعال
+- `/sessions [page]` نمایش لیست سشن‌ها (صفحه‌بندی)
+- `/attach [session_id|suffix]` اتصال به سشن detached در حال اجرا
+- `/detach` جدا شدن از سشن فعلی بدون توقف آن
+- `/status [session_id|suffix]` نمایش وضعیت سشن فعال/هدف
+- `/tail [session_id|suffix]` نمایش خروجی اخیر (یا آخرین سشن)
+- `/stop [session_id|suffix]` توقف سشن فعال/هدف
+- `/kill [session_id|suffix]` پایان فوری با تایید دو مرحله‌ای
 - `/ctrl c` ارسال Ctrl+C
 - `/ctrl d` ارسال Ctrl+D (EOF)
 - `/n` ارسال Enter/Newline
@@ -50,7 +54,9 @@
 دکمه‌های فعلی پایین چت:
 - `Status`
 - `Tail`
+- `Sessions`
 - `Stop`
+- `Detach`
 - `Ctrl+C`
 - `Enter`
 - `Clear`
@@ -95,6 +101,12 @@ DEFAULT_SHELL=/bin/bash
 WORKDIR=/home/your-user
 MAX_TAIL_LINES=30
 MAX_UPLOAD_BYTES=20971520
+MAX_RUNNING_SESSIONS_PER_USER=3
+MAX_SESSION_HISTORY_PER_USER=20
+SESSIONS_PAGE_SIZE=5
+DETACHED_SESSION_TTL_SECONDS=3600
+DETACHED_SWEEP_INTERVAL_SECONDS=30
+SESSION_DB_PATH=./session_store.sqlite3
 LOG_LEVEL=INFO
 ```
 

@@ -16,6 +16,8 @@ class Session:
     telegram_user_id: int
     chat_id: int
     command: str
+    is_attached: bool = False
+    detached_at: datetime | None = None
     mode: SessionMode = "exec"
     state: SessionState = "starting"
     started_at: datetime = field(default_factory=datetime.utcnow)

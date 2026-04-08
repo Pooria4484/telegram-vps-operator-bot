@@ -1,19 +1,25 @@
 from __future__ import annotations
 
+import json
+import logging
 import re
 import secrets
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
-from app.models import Session
+from app.models import Session, SessionState
 
 ANSI_OSC_RE = re.compile(r"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
 ANSI_CSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 ANSI_DCS_RE = re.compile(r"\x1B[P^_].*?\x1B\\", re.DOTALL)
 ANSI_ESC_RE = re.compile(r"\x1B[@-_]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
+VALID_SESSION_STATES: set[str] = {"starting", "running", "finished", "failed", "stopped"}
+
+logger = logging.getLogger(__name__)
 
 
 def sanitize_terminal_text(text: str) -> str:
@@ -23,6 +29,19 @@ def sanitize_terminal_text(text: str) -> str:
     cleaned = ANSI_ESC_RE.sub("", cleaned)
     cleaned = CTRL_RE.sub("", cleaned)
     return cleaned
+
+
+def _now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _parse_iso(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except Exception:
+        return None
 
 
 @dataclass(slots=True)
@@ -36,7 +55,7 @@ class PendingUpload:
 
 
 class SessionManager:
-    def __init__(self, default_workdir: Path) -> None:
+    def __init__(self, default_workdir: Path, db_path: Path) -> None:
         self.sessions_by_id: Dict[str, Session] = {}
         self.active_session_by_user: Dict[int, str] = {}
         self.default_workdir = default_workdir.resolve()
@@ -44,9 +63,309 @@ class SessionManager:
         self.pending_upload_by_user: Dict[int, PendingUpload] = {}
         self.stream_enabled_by_user: Dict[int, bool] = {}
 
-    def create_session(self, telegram_user_id: int, chat_id: int, command: str) -> Session:
+        self.db_path = db_path.expanduser().resolve()
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn.row_factory = sqlite3.Row
+
+        self._init_db()
+        self._load_state()
+
+    def _init_db(self) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_workdirs (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    workdir TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_snapshots (
+                    session_id TEXT PRIMARY KEY,
+                    telegram_user_id INTEGER NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    command TEXT NOT NULL,
+                    is_attached INTEGER NOT NULL DEFAULT 0,
+                    detached_at TEXT,
+                    state TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    exit_code INTEGER,
+                    tail_lines_json TEXT NOT NULL,
+                    tail_partial TEXT NOT NULL,
+                    stop_requested INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_session_user_started
+                ON session_snapshots (telegram_user_id, started_at DESC)
+                """
+            )
+
+        # Lightweight migrations for existing DBs.
+        self._ensure_column(
+            table="session_snapshots",
+            column="is_attached",
+            sql="ALTER TABLE session_snapshots ADD COLUMN is_attached INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="detached_at",
+            sql="ALTER TABLE session_snapshots ADD COLUMN detached_at TEXT",
+        )
+
+    def _ensure_column(self, table: str, column: str, sql: str) -> None:
+        rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
+        columns = {str(row["name"]) for row in rows}
+        if column in columns:
+            return
+        with self._conn:
+            self._conn.execute(sql)
+
+    def _persist_workdir(self, telegram_user_id: int, workdir: Path) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO user_workdirs (telegram_user_id, workdir, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    workdir = excluded.workdir,
+                    updated_at = excluded.updated_at
+                """,
+                (telegram_user_id, str(workdir), _now_iso()),
+            )
+
+    def _persist_session(self, session: Session) -> None:
+        started_at = session.started_at.isoformat()
+        ended_at = session.ended_at.isoformat() if session.ended_at else None
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO session_snapshots (
+                    session_id,
+                    telegram_user_id,
+                    chat_id,
+                    command,
+                    is_attached,
+                    detached_at,
+                    state,
+                    started_at,
+                    ended_at,
+                    exit_code,
+                    tail_lines_json,
+                    tail_partial,
+                    stop_requested,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    is_attached = excluded.is_attached,
+                    detached_at = excluded.detached_at,
+                    state = excluded.state,
+                    ended_at = excluded.ended_at,
+                    exit_code = excluded.exit_code,
+                    tail_lines_json = excluded.tail_lines_json,
+                    tail_partial = excluded.tail_partial,
+                    stop_requested = excluded.stop_requested,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    session.session_id,
+                    session.telegram_user_id,
+                    session.chat_id,
+                    session.command,
+                    1 if session.is_attached else 0,
+                    session.detached_at.isoformat() if session.detached_at else None,
+                    session.state,
+                    started_at,
+                    ended_at,
+                    session.exit_code,
+                    json.dumps(session.tail_lines, ensure_ascii=True),
+                    session.tail_partial,
+                    1 if session.stop_requested else 0,
+                    _now_iso(),
+                ),
+            )
+
+    def _load_state(self) -> None:
+        # Load persisted workdirs.
+        workdir_rows = self._conn.execute(
+            "SELECT telegram_user_id, workdir FROM user_workdirs"
+        ).fetchall()
+        for row in workdir_rows:
+            try:
+                self.current_workdir_by_user[int(row["telegram_user_id"])] = Path(
+                    row["workdir"]
+                ).resolve()
+            except Exception:
+                logger.exception(
+                    "Failed to restore workdir row: user_id=%s raw_path=%r",
+                    row["telegram_user_id"],
+                    row["workdir"],
+                )
+
+        # Load session history for continuity after restart.
+        session_rows = self._conn.execute(
+            """
+            SELECT
+                session_id,
+                telegram_user_id,
+                chat_id,
+                command,
+                is_attached,
+                detached_at,
+                state,
+                started_at,
+                ended_at,
+                exit_code,
+                tail_lines_json,
+                tail_partial,
+                stop_requested
+            FROM session_snapshots
+            ORDER BY started_at ASC
+            LIMIT 2000
+            """
+        ).fetchall()
+
+        recovered_running = 0
+        for row in session_rows:
+            started_at = _parse_iso(row["started_at"]) or datetime.utcnow()
+            ended_at = _parse_iso(row["ended_at"])
+
+            state_raw = str(row["state"])
+            state: SessionState = "failed"
+            if state_raw in VALID_SESSION_STATES:
+                state = state_raw  # type: ignore[assignment]
+
+            was_running = state in {"starting", "running"}
+            if was_running:
+                # Process references cannot survive restart.
+                state = "stopped"
+                ended_at = datetime.utcnow()
+                recovered_running += 1
+
+            try:
+                tail_lines_raw = json.loads(row["tail_lines_json"] or "[]")
+                tail_lines = [str(item) for item in tail_lines_raw if isinstance(item, str)]
+            except Exception:
+                tail_lines = []
+
+            session = Session(
+                session_id=str(row["session_id"]),
+                telegram_user_id=int(row["telegram_user_id"]),
+                chat_id=int(row["chat_id"]),
+                command=str(row["command"]),
+                is_attached=bool(row["is_attached"]) and not was_running,
+                detached_at=_parse_iso(row["detached_at"]),
+                state=state,
+                started_at=started_at,
+                ended_at=ended_at,
+                exit_code=row["exit_code"],
+                tail_lines=tail_lines,
+                tail_partial=str(row["tail_partial"] or ""),
+                stop_requested=bool(row["stop_requested"]),
+            )
+            self.sessions_by_id[session.session_id] = session
+
+            if session.state == "stopped" and session.tail_partial:
+                session.tail_lines.append(session.tail_partial)
+                session.tail_partial = ""
+
+            if was_running:
+                self._persist_session(session)
+
+        if recovered_running:
+            logger.info(
+                "Recovered %s running sessions as stopped after restart.",
+                recovered_running,
+            )
+
+    def save_session(self, session: Session) -> None:
+        self._persist_session(session)
+
+    def _is_running(self, session: Session) -> bool:
+        return session.state in {"starting", "running"} and session.process is not None
+
+    def count_running_sessions_for_user(self, telegram_user_id: int) -> int:
+        return sum(
+            1
+            for session in self.sessions_by_id.values()
+            if session.telegram_user_id == telegram_user_id and self._is_running(session)
+        )
+
+    def list_sessions_for_user(self, telegram_user_id: int, limit: int | None = 20) -> list[Session]:
+        sessions = [
+            s for s in self.sessions_by_id.values() if s.telegram_user_id == telegram_user_id
+        ]
+        sessions.sort(key=lambda s: s.started_at, reverse=True)
+        if limit is None:
+            return sessions
+        return sessions[:limit]
+
+    def get_session_for_user(self, telegram_user_id: int, session_id: str) -> Session | None:
+        session = self.sessions_by_id.get(session_id)
+        if not session:
+            return None
+        if session.telegram_user_id != telegram_user_id:
+            return None
+        return session
+
+    def resolve_session_token_for_user(self, telegram_user_id: int, token: str) -> Session | None:
+        token = token.strip()
+        if not token:
+            return None
+        exact = self.get_session_for_user(telegram_user_id, token)
+        if exact:
+            return exact
+        matches = [
+            s
+            for s in self.sessions_by_id.values()
+            if s.telegram_user_id == telegram_user_id and s.session_id.endswith(token)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _prune_old_stopped_sessions_for_user(self, telegram_user_id: int, max_keep: int) -> None:
+        if max_keep < 1:
+            return
+        sessions = [
+            s
+            for s in self.sessions_by_id.values()
+            if s.telegram_user_id == telegram_user_id and s.state in {"finished", "failed", "stopped"}
+        ]
+        sessions.sort(key=lambda s: s.started_at, reverse=True)
+        to_remove = sessions[max_keep:]
+        if not to_remove:
+            return
+        with self._conn:
+            for session in to_remove:
+                self.sessions_by_id.pop(session.session_id, None)
+                self._conn.execute(
+                    "DELETE FROM session_snapshots WHERE session_id = ?",
+                    (session.session_id,),
+                )
+
+    def create_session(
+        self,
+        telegram_user_id: int,
+        chat_id: int,
+        command: str,
+        max_session_history_per_user: int = 20,
+    ) -> Session:
         if telegram_user_id in self.active_session_by_user:
-            raise ValueError("user already has an active session")
+            raise ValueError("user already has an attached session")
+
+        self._prune_old_stopped_sessions_for_user(
+            telegram_user_id=telegram_user_id,
+            max_keep=max(1, max_session_history_per_user - 1),
+        )
 
         session_id = f"sess_{secrets.token_hex(4)}"
         session = Session(
@@ -54,9 +373,35 @@ class SessionManager:
             telegram_user_id=telegram_user_id,
             chat_id=chat_id,
             command=command,
+            is_attached=True,
         )
         self.sessions_by_id[session_id] = session
         self.active_session_by_user[telegram_user_id] = session_id
+        self._persist_session(session)
+        return session
+
+    def detach_active_session_for_user(self, telegram_user_id: int) -> Session | None:
+        session = self.get_active_session_for_user(telegram_user_id)
+        if not session:
+            return None
+        session.is_attached = False
+        session.detached_at = datetime.utcnow()
+        self.active_session_by_user.pop(telegram_user_id, None)
+        self._persist_session(session)
+        return session
+
+    def attach_session_for_user(self, telegram_user_id: int, session_id: str) -> Session:
+        if telegram_user_id in self.active_session_by_user:
+            raise ValueError("user already has an attached session")
+        session = self.get_session_for_user(telegram_user_id, session_id)
+        if not session:
+            raise ValueError("session not found")
+        if not self._is_running(session):
+            raise ValueError("session is not running")
+        session.is_attached = True
+        session.detached_at = None
+        self.active_session_by_user[telegram_user_id] = session.session_id
+        self._persist_session(session)
         return session
 
     def get_active_session_for_user(self, telegram_user_id: int) -> Session | None:
@@ -69,12 +414,16 @@ class SessionManager:
             return None
 
         if session.state in {"finished", "failed", "stopped"}:
+            session.is_attached = False
             self.active_session_by_user.pop(telegram_user_id, None)
+            self._persist_session(session)
             return None
 
         waiter = session.waiter_task
         if waiter is not None and waiter.done() and session.process is None:
+            session.is_attached = False
             self.active_session_by_user.pop(telegram_user_id, None)
+            self._persist_session(session)
             return None
 
         process = session.process
@@ -84,7 +433,10 @@ class SessionManager:
                 session.exit_code = process.returncode
                 session.ended_at = session.ended_at or datetime.utcnow()
             session.process = None
+            session.is_attached = False
+            session.detached_at = None
             self.active_session_by_user.pop(telegram_user_id, None)
+            self._persist_session(session)
             return None
 
         return session
@@ -100,6 +452,27 @@ class SessionManager:
 
     def finish_session(self, session: Session) -> None:
         self.active_session_by_user.pop(session.telegram_user_id, None)
+        session.is_attached = False
+        session.detached_at = None
+        self._persist_session(session)
+
+    def find_expired_detached_sessions(self, ttl_seconds: int) -> list[Session]:
+        now = datetime.utcnow()
+        expired: list[Session] = []
+        for session in self.sessions_by_id.values():
+            if session.is_attached:
+                continue
+            if session.state not in {"starting", "running"}:
+                continue
+            if session.process is None:
+                continue
+            detached_at = session.detached_at
+            if not detached_at:
+                continue
+            age = (now - detached_at).total_seconds()
+            if age >= ttl_seconds:
+                expired.append(session)
+        return expired
 
     def append_tail(self, session: Session, lines: list[str], max_tail_lines: int) -> None:
         session.tail_lines.extend(lines)
@@ -125,6 +498,8 @@ class SessionManager:
         if complete_lines:
             self.append_tail(session, complete_lines, max_tail_lines)
 
+        self._persist_session(session)
+
     def get_tail_snapshot(self, session: Session, max_tail_lines: int) -> list[str]:
         lines = list(session.tail_lines[-max_tail_lines:])
         if session.tail_partial:
@@ -137,12 +512,15 @@ class SessionManager:
         session.tail_lines.clear()
         session.tail_partial = ""
         session.stream_last_sent_text = ""
+        self._persist_session(session)
 
     def get_current_workdir(self, telegram_user_id: int) -> Path:
         return self.current_workdir_by_user.get(telegram_user_id, self.default_workdir)
 
     def set_current_workdir(self, telegram_user_id: int, workdir: Path) -> None:
-        self.current_workdir_by_user[telegram_user_id] = workdir.resolve()
+        resolved = workdir.resolve()
+        self.current_workdir_by_user[telegram_user_id] = resolved
+        self._persist_workdir(telegram_user_id, resolved)
 
     def set_pending_upload(self, pending: PendingUpload) -> None:
         self.pending_upload_by_user[pending.telegram_user_id] = pending

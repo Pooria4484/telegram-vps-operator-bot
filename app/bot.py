@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import datetime
 from html import escape
 import hashlib
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import signal
 import subprocess
 
 from aiogram import Bot, Dispatcher, F
@@ -40,6 +42,9 @@ from app.session_manager import PendingUpload, SessionManager
 
 SESSION_CONTROL_PREFIX = "sessctl"
 CONTEXT_CONTROL_PREFIX = "ctxctl"
+SESSION_LIST_PREFIX = "sesslist"
+SESSION_PAGE_PREFIX = "sesspage"
+KILL_CONFIRM_PREFIX = "killcfm"
 SESSION_STREAM_INTERVAL_SECONDS = 2.0
 SESSION_STREAM_MAX_LINES = 20
 logger = logging.getLogger(__name__)
@@ -47,6 +52,8 @@ logger = logging.getLogger(__name__)
 BTN_STATUS = "Status"
 BTN_TAIL = "Tail"
 BTN_STOP = "Stop"
+BTN_SESSIONS = "Sessions"
+BTN_DETACH = "Detach"
 BTN_CTRL_C = "Ctrl+C"
 BTN_ENTER = "Enter"
 BTN_CLEAR = "Clear"
@@ -57,12 +64,21 @@ QUICK_ACTION_BY_TEXT: dict[str, str] = {
     BTN_STATUS: "status",
     BTN_TAIL: "tail",
     BTN_STOP: "stop",
+    BTN_SESSIONS: "sessions",
+    BTN_DETACH: "detach",
     BTN_CTRL_C: "ctrl_c",
     BTN_ENTER: "enter",
     BTN_CLEAR: "clear",
     BTN_STREAM: "stream_toggle",
     BTN_HELP: "help",
 }
+
+
+@dataclass(slots=True)
+class PendingKill:
+    request_id: str
+    telegram_user_id: int
+    session_id: str
 
 
 def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
@@ -151,13 +167,17 @@ def persistent_control_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text=BTN_STATUS),
                 KeyboardButton(text=BTN_TAIL),
+                KeyboardButton(text=BTN_SESSIONS),
                 KeyboardButton(text=BTN_STOP),
-                KeyboardButton(text=BTN_CTRL_C),
             ],
             [
+                KeyboardButton(text=BTN_DETACH),
+                KeyboardButton(text=BTN_CTRL_C),
                 KeyboardButton(text=BTN_ENTER),
-                KeyboardButton(text=BTN_CLEAR),
                 KeyboardButton(text=BTN_STREAM),
+            ],
+            [
+                KeyboardButton(text=BTN_CLEAR),
                 KeyboardButton(text=BTN_HELP),
             ],
         ],
@@ -173,6 +193,7 @@ def session_control_keyboard_main(session_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Stop", callback_data=f"{SESSION_CONTROL_PREFIX}:stop:{session_id}"),
                 InlineKeyboardButton(text="Ctrl+C", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_c:{session_id}"),
                 InlineKeyboardButton(text="Status", callback_data=f"{SESSION_CONTROL_PREFIX}:status:{session_id}"),
+                InlineKeyboardButton(text="Detach", callback_data=f"{SESSION_CONTROL_PREFIX}:detach:{session_id}"),
             ],
             [
                 InlineKeyboardButton(text="Controls", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_controls:{session_id}"),
@@ -245,6 +266,114 @@ def parse_context_control_callback(data: str | None) -> str | None:
     return action
 
 
+def sessions_list_keyboard(
+    session_ids: list[str],
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for session_id in session_ids:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"Attach {session_id[-4:]}",
+                    callback_data=f"{SESSION_LIST_PREFIX}:attach:{session_id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"Tail {session_id[-4:]}",
+                    callback_data=f"{SESSION_LIST_PREFIX}:tail:{session_id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"Stop {session_id[-4:]}",
+                    callback_data=f"{SESSION_LIST_PREFIX}:stop:{session_id}",
+                ),
+                InlineKeyboardButton(
+                    text=f"Kill {session_id[-4:]}",
+                    callback_data=f"{SESSION_LIST_PREFIX}:kill:{session_id}",
+                ),
+            ]
+        )
+    nav_row: list[InlineKeyboardButton] = []
+    if page > 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="Prev",
+                callback_data=f"{SESSION_PAGE_PREFIX}:{page - 1}",
+            )
+        )
+    if page < total_pages:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="Next",
+                callback_data=f"{SESSION_PAGE_PREFIX}:{page + 1}",
+            )
+        )
+    if nav_row:
+        rows.append(nav_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def parse_sessions_list_callback(data: str | None) -> tuple[str, str] | None:
+    if not data:
+        return None
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return None
+    prefix, action, session_id = parts
+    if prefix != SESSION_LIST_PREFIX:
+        return None
+    if action not in {"attach", "tail", "stop", "kill"}:
+        return None
+    if not session_id:
+        return None
+    return action, session_id
+
+
+def parse_sessions_page_callback(data: str | None) -> int | None:
+    if not data:
+        return None
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return None
+    prefix, page_raw = parts
+    if prefix != SESSION_PAGE_PREFIX:
+        return None
+    try:
+        page = int(page_raw)
+    except ValueError:
+        return None
+    if page < 1:
+        return None
+    return page
+
+
+def kill_confirm_keyboard(request_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Confirm Kill", callback_data=f"{KILL_CONFIRM_PREFIX}:confirm:{request_id}"),
+                InlineKeyboardButton(text="Cancel", callback_data=f"{KILL_CONFIRM_PREFIX}:cancel:{request_id}"),
+            ]
+        ]
+    )
+
+
+def parse_kill_confirm_callback(data: str | None) -> tuple[str, str] | None:
+    if not data:
+        return None
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return None
+    prefix, action, request_id = parts
+    if prefix != KILL_CONFIRM_PREFIX:
+        return None
+    if action not in {"confirm", "cancel"}:
+        return None
+    if not request_id:
+        return None
+    return action, request_id
+
+
 def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
     if not data:
         return None
@@ -259,6 +388,7 @@ def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
 
     if action not in {
         "stop",
+        "detach",
         "ctrl_c",
         "ctrl_d",
         "enter",
@@ -285,7 +415,11 @@ def bot_command_menu() -> list[BotCommand]:
         BotCommand(command="run", description="Run command or cd"),
         BotCommand(command="status", description="Show active session status"),
         BotCommand(command="tail", description="Show recent output"),
+        BotCommand(command="sessions", description="List your sessions"),
+        BotCommand(command="attach", description="Attach to a running session"),
+        BotCommand(command="detach", description="Detach current session"),
         BotCommand(command="stop", description="Stop active session"),
+        BotCommand(command="kill", description="Kill a running session"),
         BotCommand(command="ctrl", description="Send Ctrl+C or Ctrl+D"),
         BotCommand(command="n", description="Send Enter/newline"),
         BotCommand(command="clear", description="Clear output buffer"),
@@ -366,8 +500,10 @@ async def answer_active_session_exists(message: Message, session_id: str) -> Non
         f"<b>You already have an active session</b>\n"
         f"<b>Session:</b> <code>{escape(session_id)}</code>\n"
         f"<b>How to continue:</b> send plain text (example: <code>ls</code>)\n"
+        f"<b>Detach first:</b> <code>/detach</code>\n"
         f"<b>Controls:</b> <code>/n</code>, <code>/ctrl c</code>, <code>/ctrl d</code>, <code>/tail</code>, "
         f"<code>/status</code>, <code>/stop</code>, <code>/clear</code>\n"
+        f"<b>Session list:</b> <code>/sessions</code>\n"
         f"<b>Stream toggle:</b> <code>/stream toggle</code> (or on/off)",
         parse_mode="HTML",
         reply_markup=persistent_control_keyboard(),
@@ -428,6 +564,7 @@ def format_session_status_message(session: Session, current_dir: Path, stream_en
         f"{format_session_header(session.session_id, session.state)}\n"
         f"━━━━━━━━━━━━━━\n"
         f"<b>Command:</b> <code>{escape(session.command)}</code>\n"
+        f"<b>Attached:</b> <code>{'yes' if session.is_attached else 'no'}</code>\n"
         f"<b>PID:</b> <code>{escape(str(pid))}</code>\n"
         f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
         f"<b>Runtime:</b> <code>{escape(str(runtime).split('.')[0])}</code>\n"
@@ -453,12 +590,20 @@ def format_help_message(current_dir: Path) -> str:
         "  کاربرد: اجرای چند دستور پشت‌سرهم در یک سشن\n"
         "  مثال: <code>/run zsh</code> سپس پیام <code>whoami</code>\n"
         "  خروج: <code>/ctrl d</code> یا <code>/stop</code>\n"
+        "• <code>/sessions</code>: نمایش لیست سشن‌ها\n"
+        "  مثال: <code>/sessions</code>\n"
+        "• <code>/attach &lt;session_id&gt;</code>: اتصال دوباره به سشن درحال اجرا\n"
+        "  مثال: <code>/attach sess_ab12cd34</code> یا فقط <code>/attach</code>\n"
+        "• <code>/detach</code>: جدا شدن از سشن فعلی بدون stop\n"
+        "  مثال: <code>/detach</code>\n"
         "• <code>/status</code>: وضعیت سشن فعال (PID, runtime, ...)\n"
-        "  مثال: <code>/status</code>\n"
+        "  مثال: <code>/status</code> یا <code>/status sess_ab12cd34</code>\n"
         "• <code>/tail</code>: نمایش خروجی اخیر (یا آخرین سشن)\n"
-        "  مثال: <code>/tail</code>\n"
+        "  مثال: <code>/tail</code> یا <code>/tail sess_ab12cd34</code>\n"
         "• <code>/stop</code>: توقف سشن فعال\n"
-        "  مثال: <code>/stop</code>\n"
+        "  مثال: <code>/stop</code> یا <code>/stop sess_ab12cd34</code>\n"
+        "• <code>/kill</code>: پایان فوری سشن فعال/هدف\n"
+        "  مثال: <code>/kill sess_ab12cd34</code>\n"
         "• <code>/ctrl c</code>: ارسال Ctrl+C به پردازش فعال\n"
         "  مثال: <code>/ctrl c</code>\n"
         "• <code>/ctrl d</code>: ارسال Ctrl+D (EOF) به PTY\n"
@@ -490,12 +635,20 @@ def format_help_message(current_dir: Path) -> str:
         "  Use case: keep one live shell and send multiple commands\n"
         "  Example: <code>/run bash</code>, then send plain text <code>pwd</code>\n"
         "  Exit: <code>/ctrl d</code> or <code>/stop</code>\n"
+        "• <code>/sessions</code>: list your sessions\n"
+        "  Example: <code>/sessions</code>\n"
+        "• <code>/attach &lt;session_id&gt;</code>: attach to a running session\n"
+        "  Example: <code>/attach sess_ab12cd34</code> or just <code>/attach</code>\n"
+        "• <code>/detach</code>: detach from current session without stopping it\n"
+        "  Example: <code>/detach</code>\n"
         "• <code>/status</code>: show active session state\n"
-        "  Example: <code>/status</code>\n"
+        "  Example: <code>/status</code> or <code>/status sess_ab12cd34</code>\n"
         "• <code>/tail</code>: show recent output (or latest session)\n"
-        "  Example: <code>/tail</code>\n"
+        "  Example: <code>/tail</code> or <code>/tail sess_ab12cd34</code>\n"
         "• <code>/stop</code>: stop active session\n"
-        "  Example: <code>/stop</code>\n"
+        "  Example: <code>/stop</code> or <code>/stop sess_ab12cd34</code>\n"
+        "• <code>/kill</code>: force-kill active/target session\n"
+        "  Example: <code>/kill sess_ab12cd34</code>\n"
         "• <code>/ctrl c</code>: send Ctrl+C\n"
         "  Example: <code>/ctrl c</code>\n"
         "• <code>/ctrl d</code>: send Ctrl+D (EOF)\n"
@@ -531,9 +684,33 @@ def format_tail_message(session: Session, tail_lines: list[str]) -> str:
     return (
         f"{format_session_header(session.session_id, session.state)}\n"
         f"━━━━━━━━━━━━━━\n"
+        f"<b>Attached:</b> <code>{'yes' if session.is_attached else 'no'}</code>\n"
         f"<b>Tail</b>\n"
         f"{render_output_lines(text)}"
     )
+
+
+def format_sessions_list_message(sessions: list[Session], max_running: int, running_count: int) -> str:
+    if not sessions:
+        return "<b>No sessions found</b>"
+
+    lines: list[str] = [
+        "<b>Your Sessions</b>",
+        f"<b>Running:</b> <code>{running_count}/{max_running}</code>",
+        "━━━━━━━━━━━━━━",
+    ]
+    for session in sessions:
+        runtime_end = session.ended_at or datetime.utcnow()
+        runtime = str((runtime_end - session.started_at)).split(".")[0]
+        attached = "yes" if session.is_attached else "no"
+        lines.append(
+            f"<b>{escape(session.session_id)}</b> | "
+            f"<code>{escape(session.state)}</code> | "
+            f"attached=<code>{attached}</code> | "
+            f"runtime=<code>{escape(runtime)}</code>\n"
+            f"<code>{escape(session.command)}</code>"
+        )
+    return "\n".join(lines)
 
 
 async def read_session_output(
@@ -696,6 +873,14 @@ async def wait_session_exit(
 
 def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dispatcher:
     dp = Dispatcher()
+    pending_kill_by_user: dict[int, PendingKill] = {}
+
+    def parse_optional_session_id(text: str) -> str | None:
+        parts = text.strip().split(maxsplit=1)
+        if len(parts) < 2:
+            return None
+        candidate = parts[1].strip()
+        return candidate or None
 
     async def do_help(message: Message, user_id: int) -> None:
         current_dir = session_manager.get_current_workdir(user_id)
@@ -705,10 +890,25 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             reply_markup=persistent_control_keyboard(),
         )
 
-    async def do_status(message: Message, user_id: int) -> None:
+    def resolve_session_token(user_id: int, token: str | None) -> Session | None:
+        if not token:
+            return None
+        return session_manager.resolve_session_token_for_user(user_id, token)
+
+    async def do_status(message: Message, user_id: int, session_id: str | None = None) -> None:
         current_dir = session_manager.get_current_workdir(user_id)
-        session = session_manager.get_active_session_for_user(user_id)
+        if session_id:
+            session = resolve_session_token(user_id, session_id)
+        else:
+            session = session_manager.get_active_session_for_user(user_id)
         if not session:
+            if session_id:
+                await message.answer(
+                    f"<b>Session not found</b>\n"
+                    f"<b>Session:</b> <code>{escape(session_id)}</code>",
+                    parse_mode="HTML",
+                )
+                return
             await answer_no_active_session(message, current_dir)
             return
 
@@ -718,22 +918,123 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             parse_mode="HTML",
         )
 
-    async def do_tail(message: Message, user_id: int) -> None:
+    async def do_tail(message: Message, user_id: int, session_id: str | None = None) -> None:
         current_dir = session_manager.get_current_workdir(user_id)
-        session = session_manager.get_active_session_for_user(user_id)
-        if not session:
+        if session_id:
+            session = resolve_session_token(user_id, session_id)
+        else:
+            session = session_manager.get_active_session_for_user(user_id)
+        if not session and not session_id:
             session = session_manager.get_latest_session_for_user(user_id)
         if not session:
+            if session_id:
+                await message.answer(
+                    f"<b>Session not found</b>\n"
+                    f"<b>Session:</b> <code>{escape(session_id)}</code>",
+                    parse_mode="HTML",
+                )
+                return
             await answer_no_active_session(message, current_dir)
             return
 
         tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
         await message.answer(format_tail_message(session, tail_lines), parse_mode="HTML")
 
-    async def do_stop(message: Message, user_id: int) -> None:
-        current_dir = session_manager.get_current_workdir(user_id)
-        session = session_manager.get_active_session_for_user(user_id)
+    async def do_sessions(message: Message, user_id: int, page: int = 1) -> None:
+        sessions = session_manager.list_sessions_for_user(user_id, limit=None)
+        running_count = session_manager.count_running_sessions_for_user(user_id)
+        if not sessions:
+            await message.answer("<b>No sessions found</b>", parse_mode="HTML")
+            return
+        page_size = settings.sessions_page_size
+        total_pages = max(1, (len(sessions) + page_size - 1) // page_size)
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        page_sessions = sessions[start : start + page_size]
+        session_ids = [s.session_id for s in page_sessions if s.state in {"starting", "running"}]
+        body = format_sessions_list_message(
+            sessions=page_sessions,
+            max_running=settings.max_running_sessions_per_user,
+            running_count=running_count,
+        )
+        await message.answer(
+            f"{body}\n<b>Page:</b> <code>{page}/{total_pages}</code>",
+            parse_mode="HTML",
+            reply_markup=(
+                sessions_list_keyboard(session_ids, page=page, total_pages=total_pages)
+                if session_ids or total_pages > 1
+                else None
+            ),
+        )
+
+    async def do_detach(message: Message, user_id: int) -> None:
+        session = session_manager.detach_active_session_for_user(user_id)
         if not session:
+            current_dir = session_manager.get_current_workdir(user_id)
+            await answer_no_active_session(message, current_dir)
+            return
+        await message.answer(
+            f"<b>Detached</b>\n"
+            f"<b>Session:</b> <code>{escape(session.session_id)}</code>\n"
+            f"<b>Use:</b> <code>/attach {escape(session.session_id)}</code> to re-attach later.",
+            parse_mode="HTML",
+        )
+
+    async def do_attach(message: Message, user_id: int, session_id: str | None = None) -> None:
+        if not session_id:
+            candidates = [
+                s
+                for s in session_manager.list_sessions_for_user(user_id, limit=None)
+                if s.state in {"starting", "running"} and s.process is not None and not s.is_attached
+            ]
+            if len(candidates) == 1:
+                session_id = candidates[0].session_id
+            elif not candidates:
+                await message.answer(
+                    "<b>Attach failed</b>\n<code>no running detached session found</code>",
+                    parse_mode="HTML",
+                )
+                return
+            else:
+                await message.answer(
+                    "<b>Attach failed</b>\n"
+                    "<code>multiple detached sessions found, use /sessions then pick one</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+        try:
+            session = session_manager.attach_session_for_user(user_id, session_id)
+        except ValueError as exc:
+            await message.answer(
+                f"<b>Attach failed</b>\n"
+                f"<code>{escape(str(exc))}</code>",
+                parse_mode="HTML",
+            )
+            return
+        current_dir = session_manager.get_current_workdir(user_id)
+        await message.answer(
+            f"<b>Attached</b>\n"
+            f"<b>Session:</b> <code>{escape(session.session_id)}</code>\n"
+            f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>",
+            parse_mode="HTML",
+            reply_markup=session_control_keyboard_main(session.session_id),
+        )
+
+    async def do_stop(message: Message, user_id: int, session_id: str | None = None) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        if session_id:
+            session = resolve_session_token(user_id, session_id)
+        else:
+            session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            if session_id:
+                await message.answer(
+                    f"<b>Session not found</b>\n"
+                    f"<b>Session:</b> <code>{escape(session_id)}</code>",
+                    parse_mode="HTML",
+                )
+                return
             await answer_no_active_session(message, current_dir)
             return
 
@@ -755,6 +1056,65 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         )
         await message.answer(f"Stop requested for session {session.session_id}.")
         await stop_live_command(process)
+
+    async def do_kill(message: Message, user_id: int, session_id: str | None = None) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        if session_id:
+            session = resolve_session_token(user_id, session_id)
+        else:
+            session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            if session_id:
+                await message.answer(
+                    f"<b>Session not found</b>\n"
+                    f"<b>Session:</b> <code>{escape(session_id)}</code>",
+                    parse_mode="HTML",
+                )
+                return
+            await answer_no_active_session(message, current_dir)
+            return
+
+        process = session.process
+        if process is None or process.returncode is not None:
+            await message.answer("No live process is attached to the target session.")
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await message.answer(f"Kill requested for session {session.session_id}.")
+
+    async def do_kill_request(message: Message, user_id: int, session_id: str | None = None) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        if session_id:
+            session = resolve_session_token(user_id, session_id)
+        else:
+            session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            if session_id:
+                await message.answer(
+                    f"<b>Session not found</b>\n"
+                    f"<b>Session:</b> <code>{escape(session_id)}</code>",
+                    parse_mode="HTML",
+                )
+                return
+            await answer_no_active_session(message, current_dir)
+            return
+        process = session.process
+        if process is None or process.returncode is not None:
+            await message.answer("No live process is attached to the target session.")
+            return
+        request_id = secrets.token_hex(4)
+        pending_kill_by_user[user_id] = PendingKill(
+            request_id=request_id,
+            telegram_user_id=user_id,
+            session_id=session.session_id,
+        )
+        await message.answer(
+            f"<b>Kill confirmation</b>\n"
+            f"<b>Session:</b> <code>{escape(session.session_id)}</code>\n"
+            f"<b>Command:</b> <code>{escape(session.command)}</code>",
+            parse_mode="HTML",
+            reply_markup=kill_confirm_keyboard(request_id),
+        )
 
     async def do_ctrl_c(message: Message, user_id: int) -> None:
         current_dir = session_manager.get_current_workdir(user_id)
@@ -846,6 +1206,55 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         state_text = "enabled" if enabled else "disabled"
         await message.answer(f"Stream mode {state_text}.", parse_mode="HTML")
 
+    async def detached_session_ttl_sweeper(bot: Bot) -> None:
+        while True:
+            await asyncio.sleep(settings.detached_sweep_interval_seconds)
+            expired = session_manager.find_expired_detached_sessions(
+                settings.detached_session_ttl_seconds
+            )
+            if not expired:
+                continue
+            for session in expired:
+                process = session.process
+                if process is None:
+                    continue
+                session.stop_requested = True
+                logger.info(
+                    "Auto-stop detached session by TTL: user_id=%s session_id=%s command=%r",
+                    session.telegram_user_id,
+                    session.session_id,
+                    session.command,
+                )
+                await stop_live_command(process)
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        session.chat_id,
+                        (
+                            "<b>Session auto-stopped</b>\n"
+                            f"<b>Session:</b> <code>{escape(session.session_id)}</code>\n"
+                            "<b>Reason:</b> <code>detached session TTL expired</code>"
+                        ),
+                        parse_mode="HTML",
+                    )
+
+    async def on_startup(bot: Bot) -> None:
+        if getattr(dp, "_detached_sweeper_task", None) is not None:
+            return
+        dp._detached_sweeper_task = asyncio.create_task(detached_session_ttl_sweeper(bot))
+
+    async def on_shutdown(bot: Bot) -> None:
+        del bot
+        task = getattr(dp, "_detached_sweeper_task", None)
+        if task is None:
+            return
+        task.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(task, timeout=2)
+        dp._detached_sweeper_task = None
+
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+
     @dp.message(CommandStart())
     async def start_handler(message: Message) -> None:
         user = message.from_user
@@ -859,14 +1268,18 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "/help\n"
             "/id\n"
             "/run <command>\n"
-            "/stop\n"
+            "/sessions\n"
+            "/attach <session_id>\n"
+            "/detach\n"
+            "/stop [session_id]\n"
+            "/kill [session_id]\n"
             "/ctrl <c|d>\n"
             "/n\n"
             "/clear\n"
             "/stream <on|off|toggle|status> (alias: /live)\n"
             "/get <path>\n"
-            "/status\n"
-            "/tail\n\n"
+            "/status [session_id]\n"
+            "/tail [session_id]\n\n"
             "Upload behavior:\n"
             "- send a file directly\n"
             "- it will be saved in your current dir\n\n"
@@ -896,7 +1309,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        await do_status(message, user.id)
+        session_id = parse_optional_session_id(message.text or "")
+        await do_status(message, user.id, session_id=session_id)
 
     @dp.message(Command("tail"))
     async def tail_handler(message: Message) -> None:
@@ -904,7 +1318,38 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        await do_tail(message, user.id)
+        session_id = parse_optional_session_id(message.text or "")
+        await do_tail(message, user.id, session_id=session_id)
+
+    @dp.message(Command("sessions"))
+    async def sessions_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        token = parse_optional_session_id(message.text or "")
+        page = 1
+        if token:
+            try:
+                page = int(token)
+            except ValueError:
+                page = 1
+        await do_sessions(message, user.id, page=page)
+
+    @dp.message(Command("attach"))
+    async def attach_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        session_id = parse_optional_session_id(message.text or "")
+        await do_attach(message, user.id, session_id)
+
+    @dp.message(Command("detach"))
+    async def detach_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        await do_detach(message, user.id)
 
     @dp.message(Command("get"))
     async def get_handler(message: Message) -> None:
@@ -1193,13 +1638,24 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         action, target_session_id = parsed
         current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
+        session = session_manager.get_session_for_user(user.id, target_session_id)
         if not session:
-            await callback.answer("No active session.", show_alert=False)
+            await callback.answer("Session not found.", show_alert=False)
             return
 
-        if session.session_id != target_session_id:
-            await callback.answer("Stale control.", show_alert=False)
+        if action == "detach":
+            active = session_manager.get_active_session_for_user(user.id)
+            if not active:
+                await callback.answer("No attached session.", show_alert=False)
+                return
+            if active.session_id != session.session_id:
+                await callback.answer("Detach only works for attached session.", show_alert=False)
+                return
+            detached = session_manager.detach_active_session_for_user(user.id)
+            if not detached:
+                await callback.answer("No attached session.", show_alert=False)
+                return
+            await callback.answer("Detached.", show_alert=False)
             return
 
         if action == "menu_main":
@@ -1340,13 +1796,95 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         await do_tail(callback.message, user.id)
         await callback.answer("Tail sent.", show_alert=False)
 
+    @dp.callback_query(F.data.startswith(f"{SESSION_LIST_PREFIX}:"))
+    async def session_list_control_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        parsed = parse_sessions_list_callback(callback.data)
+        if not parsed:
+            await callback.answer("Invalid action.", show_alert=False)
+            return
+        action, session_id = parsed
+        if not callback.message:
+            await callback.answer("No message context.", show_alert=False)
+            return
+
+        if action == "attach":
+            await do_attach(callback.message, user.id, session_id)
+            await callback.answer("Attach requested.", show_alert=False)
+            return
+        if action == "tail":
+            await do_tail(callback.message, user.id, session_id=session_id)
+            await callback.answer("Tail sent.", show_alert=False)
+            return
+        if action == "stop":
+            await do_stop(callback.message, user.id, session_id=session_id)
+            await callback.answer("Stop requested.", show_alert=False)
+            return
+        await do_kill_request(callback.message, user.id, session_id=session_id)
+        await callback.answer("Kill confirmation sent.", show_alert=False)
+
+    @dp.callback_query(F.data.startswith(f"{SESSION_PAGE_PREFIX}:"))
+    async def sessions_page_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        page = parse_sessions_page_callback(callback.data)
+        if page is None:
+            await callback.answer("Invalid page.", show_alert=False)
+            return
+        if not callback.message:
+            await callback.answer("No message context.", show_alert=False)
+            return
+        await do_sessions(callback.message, user.id, page=page)
+        await callback.answer(f"Page {page}.", show_alert=False)
+
+    @dp.callback_query(F.data.startswith(f"{KILL_CONFIRM_PREFIX}:"))
+    async def kill_confirm_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        parsed = parse_kill_confirm_callback(callback.data)
+        if not parsed:
+            await callback.answer("Invalid action.", show_alert=False)
+            return
+        action, request_id = parsed
+        pending = pending_kill_by_user.get(user.id)
+        if not pending or pending.request_id != request_id:
+            await callback.answer("Stale kill request.", show_alert=False)
+            return
+        if action == "cancel":
+            pending_kill_by_user.pop(user.id, None)
+            if callback.message:
+                with contextlib.suppress(Exception):
+                    await callback.message.edit_text("<b>Kill cancelled</b>", parse_mode="HTML")
+            await callback.answer("Kill cancelled.", show_alert=False)
+            return
+        if not callback.message:
+            await callback.answer("No message context.", show_alert=False)
+            return
+        pending_kill_by_user.pop(user.id, None)
+        await do_kill(callback.message, user.id, session_id=pending.session_id)
+        await callback.answer("Kill requested.", show_alert=False)
+
     @dp.message(Command("stop"))
     async def stop_handler(message: Message) -> None:
         user = message.from_user
         if not user or not is_allowed(user.id, settings):
             return
 
-        await do_stop(message, user.id)
+        session_id = parse_optional_session_id(message.text or "")
+        await do_stop(message, user.id, session_id=session_id)
+
+    @dp.message(Command("kill"))
+    async def kill_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        session_id = parse_optional_session_id(message.text or "")
+        await do_kill_request(message, user.id, session_id=session_id)
 
     @dp.message(Command("ctrl"))
     async def ctrl_handler(message: Message) -> None:
@@ -1420,6 +1958,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
         if action == "tail":
             await do_tail(message, user.id)
+            return
+        if action == "sessions":
+            await do_sessions(message, user.id)
+            return
+        if action == "detach":
+            await do_detach(message, user.id)
             return
         if action == "stop":
             await do_stop(message, user.id)
@@ -1497,6 +2041,17 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await answer_active_session_exists(message, active.session_id)
             return
 
+        running_count = session_manager.count_running_sessions_for_user(user.id)
+        if running_count >= settings.max_running_sessions_per_user:
+            await message.answer(
+                f"<b>Run blocked</b>\n"
+                f"<b>Reason:</b> <code>running session limit reached</code>\n"
+                f"<b>Running:</b> <code>{running_count}/{settings.max_running_sessions_per_user}</code>\n"
+                f"<b>Use:</b> <code>/sessions</code> then stop/attach/detach as needed.",
+                parse_mode="HTML",
+            )
+            return
+
         if should_run_without_pty(command):
             try:
                 exit_code, stdout_text, stderr_text = await asyncio.to_thread(
@@ -1542,6 +2097,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             telegram_user_id=user.id,
             chat_id=message.chat.id,
             command=command,
+            max_session_history_per_user=settings.max_session_history_per_user,
         )
         logger.info(
             "Starting live session: user_id=%s session_id=%s command=%r cwd=%s",
@@ -1589,6 +2145,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         session.process = live.process
         session.pty_master_fd = live.pty_master_fd
         session.stream_last_sent_text = ""
+        session.is_attached = True
+        session_manager.save_session(session)
         session.reader_task = asyncio.create_task(
             read_session_output(session, session_manager, settings.max_tail_lines)
         )
@@ -1643,10 +2201,17 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         current_dir = session_manager.get_current_workdir(user.id)
+        running_count = session_manager.count_running_sessions_for_user(user.id)
+        hint = (
+            f"\n<b>Hint:</b> <code>/sessions</code> to attach a running detached session."
+            if running_count > 0
+            else ""
+        )
         await message.answer(
             f"<b>No active route for plain text</b>\n"
             f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
-            f"<b>Use:</b> <code>/run &lt;command&gt;</code> for shell.",
+            f"<b>Use:</b> <code>/run &lt;command&gt;</code> for shell."
+            f"{hint}",
             parse_mode="HTML",
             reply_markup=context_control_keyboard("help", "status"),
         )

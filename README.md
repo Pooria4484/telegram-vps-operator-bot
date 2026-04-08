@@ -33,9 +33,13 @@ This project focuses on practical VPS workflows:
 - `/id` Show your Telegram user ID
 - `/run <command>` Run a command
 - `/run cd <path>` Change your current working directory
-- `/status` Show active session status
-- `/tail` Show recent output (or latest session output)
-- `/stop` Stop active session
+- `/sessions [page]` List your sessions (with pagination)
+- `/attach [session_id|suffix]` Attach to a running detached session
+- `/detach` Detach current session without stopping it
+- `/status [session_id|suffix]` Show active/target session status
+- `/tail [session_id|suffix]` Show recent output (or latest session output)
+- `/stop [session_id|suffix]` Stop active/target session
+- `/kill [session_id|suffix]` Force kill with two-step confirmation
 - `/ctrl c` Send Ctrl+C to active process group
 - `/ctrl d` Send Ctrl+D (EOF) to active PTY
 - `/n` Send Enter/newline to active PTY
@@ -49,7 +53,9 @@ This project focuses on practical VPS workflows:
 Current quick actions shown in chat keyboard:
 - `Status`
 - `Tail`
+- `Sessions`
 - `Stop`
+- `Detach`
 - `Ctrl+C`
 - `Enter`
 - `Clear`
@@ -94,6 +100,12 @@ DEFAULT_SHELL=/bin/bash
 WORKDIR=/home/your-user
 MAX_TAIL_LINES=30
 MAX_UPLOAD_BYTES=20971520
+MAX_RUNNING_SESSIONS_PER_USER=3
+MAX_SESSION_HISTORY_PER_USER=20
+SESSIONS_PAGE_SIZE=5
+DETACHED_SESSION_TTL_SECONDS=3600
+DETACHED_SWEEP_INTERVAL_SECONDS=30
+SESSION_DB_PATH=./session_store.sqlite3
 LOG_LEVEL=INFO
 ```
 

@@ -23,6 +23,10 @@ dist/
 .mypy_cache/
 .ruff_cache/
 
+# Local runtime state
+session_store.sqlite3
+.codex
+
 # OS / editor noise
 .DS_Store
 .vscode/
