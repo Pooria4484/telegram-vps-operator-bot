@@ -18,9 +18,15 @@
 - کنترل سشن: Stop، Ctrl+C، Ctrl+D، Enter
 - پاک‌سازی escape sequence های ترمینال از خروجی
 - حالت استریم خروجی با `/stream` یا `/live`
-- آپلود فایل در مسیر کاری فعلی
+- آپلود فایل در مسیر کاری فعلی با تایید overwrite
+- محدودیت اندازه آپلود + خطای شفاف برای فایل بزرگ
+- ضد stale شدن دکمه‌های overwrite/cancel آپلود
 - دانلود فایل با `/get <path>`
 - نمایش SHA256 در آپلود/دانلود
+- پیشنهاد دستورها با `/` (Bot Command Menu)
+- کیبورد اکشن سریع (غیردائمی)
+- دکمه‌های inline کمکی (`Help`, `Status`, `Tail`) برای پیام‌های usage/error
+- لاگ عملیاتی پایه (startup/session/upload/get)
 
 ## دستورات
 
@@ -38,6 +44,18 @@
 - `/stream on|off|toggle|status` مدیریت استریم خروجی
 - `/live ...` نام جایگزین برای `/stream ...`
 - `/get <path>` دریافت فایل از VPS
+
+## کیبورد اکشن سریع
+
+دکمه‌های فعلی پایین چت:
+- `Status`
+- `Tail`
+- `Stop`
+- `Ctrl+C`
+- `Enter`
+- `Clear`
+- `Stream`
+- `Help`
 
 ## مثال‌های Bash و Zsh
 
@@ -76,6 +94,8 @@ ALLOWED_USER_IDS=123456789,987654321
 DEFAULT_SHELL=/bin/bash
 WORKDIR=/home/your-user
 MAX_TAIL_LINES=30
+MAX_UPLOAD_BYTES=20971520
+LOG_LEVEL=INFO
 ```
 
 4. اجرا:
@@ -112,4 +132,3 @@ sudo systemctl status tg-vps-bot.service
 - `app/session_manager.py` مدیریت state سشن و بافر خروجی
 - `app/config.py` تنظیمات محیطی
 - `systemd/tg-vps-bot.service` نمونه سرویس
-

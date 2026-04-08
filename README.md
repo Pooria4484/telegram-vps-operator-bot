@@ -18,9 +18,14 @@ This project focuses on practical VPS workflows:
 - Session controls: stop, Ctrl+C, Ctrl+D, Enter
 - Output tail buffer with ANSI/control-sequence sanitization
 - Optional live stream output mode (`/stream` or `/live`)
-- File upload to current working directory
+- File upload to current working directory with overwrite confirmation
+- Upload filename sanitization and size limit enforcement
 - File download with `/get <path>`
 - SHA256 hash in upload/download responses
+- Command suggestions on `/` via Telegram bot command menu
+- Quick action keyboard (non-persistent)
+- Context inline controls (`Help`, `Status`, `Tail`) on usage/error messages
+- Baseline operational logging (startup/session/upload/get)
 
 ## Commands
 
@@ -38,6 +43,18 @@ This project focuses on practical VPS workflows:
 - `/stream on|off|toggle|status` Control stream mode
 - `/live ...` Alias for `/stream ...`
 - `/get <path>` Download file from VPS
+
+## Quick Action Keyboard
+
+Current quick actions shown in chat keyboard:
+- `Status`
+- `Tail`
+- `Stop`
+- `Ctrl+C`
+- `Enter`
+- `Clear`
+- `Stream`
+- `Help`
 
 ## Interactive Shell Examples
 
@@ -76,6 +93,8 @@ ALLOWED_USER_IDS=123456789,987654321
 DEFAULT_SHELL=/bin/bash
 WORKDIR=/home/your-user
 MAX_TAIL_LINES=30
+MAX_UPLOAD_BYTES=20971520
+LOG_LEVEL=INFO
 ```
 
 4. Run:
@@ -119,4 +138,3 @@ sudo systemctl status tg-vps-bot.service
 - `app/session_manager.py` session state and output buffering
 - `app/config.py` environment configuration
 - `systemd/tg-vps-bot.service` service unit sample
-

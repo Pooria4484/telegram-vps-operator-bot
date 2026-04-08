@@ -24,17 +24,27 @@ At the current stage, the bot already supports:
 - Telegram user whitelist via `ALLOWED_USER_IDS`
 - basic bot startup and command routing
 - `/id`
-- `/run <command>` for non-interactive execution
+- `/run <command>` with live PTY-backed execution
 - persistent per-user working directory
 - `cd` handling through `/run cd ...`
 - `/status`
 - `/tail`
+- `/stop`
+- `/ctrl c`, `/ctrl d`, `/n`
+- plain-text routing into active PTY session
+- `/stream <on|off|toggle|status>` (`/live` alias)
+- `/clear` output buffer
 - `/get <path>`
 - direct file upload into current working directory
 - overwrite confirmation for duplicate uploaded files
+- stale-safe overwrite/cancel upload callbacks
+- upload filename sanitization
+- upload size-limit enforcement via `MAX_UPLOAD_BYTES`
 - SHA256 reporting for file send and upload
-
-The current `/run` implementation is **not yet PTY/live interactive**. It still executes commands in a non-interactive request/response manner.
+- quick action keyboard in chat
+- inline session control menus and context inline helper controls
+- Telegram slash command suggestions via `setMyCommands`
+- baseline operational logging with configurable `LOG_LEVEL`
 
 ---
 
@@ -53,7 +63,7 @@ Completed or mostly completed:
 - SHA256 reporting
 
 ### Phase 2 - Live execution core
-Next major target:
+Completed:
 
 - replace simple command execution with **PTY-based live sessions**
 - keep one active session per Telegram user
@@ -63,7 +73,7 @@ Next major target:
 - make `/status` meaningful for live sessions
 
 ### Phase 3 - Interactive controls
-After PTY live sessions work:
+Completed:
 
 - `/ctrl c`
 - `/ctrl d`
@@ -72,7 +82,7 @@ After PTY live sessions work:
 - clean session state transitions
 
 ### Phase 4 - Telegram UX controls
-After interactive controls work:
+Mostly completed:
 
 - inline buttons for Stop / Kill / Ctrl+C / Ctrl+D / Enter / Status
 - separate control message and output message
@@ -89,12 +99,12 @@ After live PTY is stable:
 - summary mode or capped tail mode for noisy streams
 
 ### Phase 6 - Robustness and persistence
-Later improvements:
+In progress:
 
 - SQLite-backed session metadata
 - transcript persistence
 - better recovery and audit trail
-- upload size limits and explicit user-facing error messages
+- upload size limits and explicit user-facing error messages (implemented)
 - file overwrite policies and conflict handling improvements
 
 ---
@@ -169,24 +179,20 @@ When working on this repository:
 
 The next recommended implementation step is:
 
-### Implement live PTY-backed sessions with `/stop`
+### Phase 6 persistence and long-output safety
 
 Scope:
 
-- replace the current blocking `/run` execution path with a PTY-backed live process model
-- keep an active live process per user
-- store enough session state to support `/status`, `/tail`, and `/stop`
-- keep output buffering simple at first
-- do **not** yet add full inline button UX in the same step
-- do **not** yet add full free-form interactive stdin routing in the same step unless explicitly requested
+- persist session metadata (SQLite) so key state survives process restart
+- add safe output truncation/chunking for Telegram message length limits
+- keep current PTY/live workflows and controls unchanged
+- keep whitelist and per-user working-directory behavior unchanged
 
 Success criteria:
 
-- `/run <long-running-command>` starts and keeps a live session active
-- `/status` shows that session as active/running
-- `/tail` shows recent output from the live session
-- `/stop` cleanly terminates the live session
-- existing whitelist and current working directory behavior still works
+- bot restart does not leave broken active-session pointers
+- long outputs are delivered without Telegram send/edit failures
+- current command and control workflows remain stable
 
 ---
 
