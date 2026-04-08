@@ -445,6 +445,33 @@ def should_run_without_pty(command: str) -> bool:
     return bool({"--version", "-V", "--help", "-h"} & flags)
 
 
+def is_shell_session_command(command: str) -> bool:
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        return False
+    if not parts:
+        return False
+    executable = Path(parts[0]).name.lower()
+    return executable in {"bash", "zsh", "sh", "dash", "ash", "ksh", "fish"}
+
+
+def is_detached_session_idle_for_ttl(session: Session) -> bool:
+    process = session.process
+    if process is None or process.returncode is not None:
+        return False
+    if not is_shell_session_command(session.command):
+        # For non-shell detached commands, avoid TTL-based stop while they are executing.
+        return False
+    pid = process.pid
+    children_path = Path(f"/proc/{pid}/task/{pid}/children")
+    try:
+        children_raw = children_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return not bool(children_raw)
+
+
 def format_session_header(session_id: str, state: str) -> str:
     safe_session_id = escape(session_id)
     safe_state = escape(state)
@@ -1209,21 +1236,33 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
     async def detached_session_ttl_sweeper(bot: Bot) -> None:
         while True:
             await asyncio.sleep(settings.detached_sweep_interval_seconds)
-            expired = session_manager.find_expired_detached_sessions(
-                settings.detached_session_ttl_seconds
-            )
-            if not expired:
+            candidates = session_manager.list_detached_running_sessions()
+            if not candidates:
                 continue
-            for session in expired:
+            now = datetime.utcnow()
+            for session in candidates:
+                if not is_detached_session_idle_for_ttl(session):
+                    if session.detached_at is not None:
+                        session.detached_at = None
+                        session_manager.save_session(session)
+                    continue
+                if session.detached_at is None:
+                    session.detached_at = now
+                    session_manager.save_session(session)
+                    continue
+                idle_age = (now - session.detached_at).total_seconds()
+                if idle_age < settings.detached_session_ttl_seconds:
+                    continue
                 process = session.process
                 if process is None:
                     continue
                 session.stop_requested = True
                 logger.info(
-                    "Auto-stop detached session by TTL: user_id=%s session_id=%s command=%r",
+                    "Auto-stop detached idle session by TTL: user_id=%s session_id=%s command=%r idle_age_seconds=%s",
                     session.telegram_user_id,
                     session.session_id,
                     session.command,
+                    int(idle_age),
                 )
                 await stop_live_command(process)
                 with contextlib.suppress(Exception):
@@ -1232,7 +1271,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                         (
                             "<b>Session auto-stopped</b>\n"
                             f"<b>Session:</b> <code>{escape(session.session_id)}</code>\n"
-                            "<b>Reason:</b> <code>detached session TTL expired</code>"
+                            "<b>Reason:</b> <code>detached idle TTL expired</code>"
                         ),
                         parse_mode="HTML",
                     )

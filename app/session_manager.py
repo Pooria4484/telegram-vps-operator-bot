@@ -385,7 +385,8 @@ class SessionManager:
         if not session:
             return None
         session.is_attached = False
-        session.detached_at = datetime.utcnow()
+        # Detached TTL starts only after the session becomes idle.
+        session.detached_at = None
         self.active_session_by_user.pop(telegram_user_id, None)
         self._persist_session(session)
         return session
@@ -456,9 +457,8 @@ class SessionManager:
         session.detached_at = None
         self._persist_session(session)
 
-    def find_expired_detached_sessions(self, ttl_seconds: int) -> list[Session]:
-        now = datetime.utcnow()
-        expired: list[Session] = []
+    def list_detached_running_sessions(self) -> list[Session]:
+        sessions: list[Session] = []
         for session in self.sessions_by_id.values():
             if session.is_attached:
                 continue
@@ -466,13 +466,8 @@ class SessionManager:
                 continue
             if session.process is None:
                 continue
-            detached_at = session.detached_at
-            if not detached_at:
-                continue
-            age = (now - detached_at).total_seconds()
-            if age >= ttl_seconds:
-                expired.append(session)
-        return expired
+            sessions.append(session)
+        return sessions
 
     def append_tail(self, session: Session, lines: list[str], max_tail_lines: int) -> None:
         session.tail_lines.extend(lines)
