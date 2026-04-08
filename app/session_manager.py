@@ -6,7 +6,7 @@ import re
 import secrets
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict
 
@@ -31,10 +31,6 @@ def sanitize_terminal_text(text: str) -> str:
     return cleaned
 
 
-def _now_iso() -> str:
-    return datetime.utcnow().isoformat()
-
-
 def _parse_iso(raw: str | None) -> datetime | None:
     if not raw:
         return None
@@ -55,13 +51,14 @@ class PendingUpload:
 
 
 class SessionManager:
-    def __init__(self, default_workdir: Path, db_path: Path) -> None:
+    def __init__(self, default_workdir: Path, db_path: Path, time_offset_minutes: int) -> None:
         self.sessions_by_id: Dict[str, Session] = {}
         self.active_session_by_user: Dict[int, str] = {}
         self.default_workdir = default_workdir.resolve()
         self.current_workdir_by_user: Dict[int, Path] = {}
         self.pending_upload_by_user: Dict[int, PendingUpload] = {}
         self.stream_enabled_by_user: Dict[int, bool] = {}
+        self.time_offset = timedelta(minutes=time_offset_minutes)
 
         self.db_path = db_path.expanduser().resolve()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,6 +67,12 @@ class SessionManager:
 
         self._init_db()
         self._load_state()
+
+    def now(self) -> datetime:
+        return datetime.utcnow() + self.time_offset
+
+    def _now_iso(self) -> str:
+        return self.now().isoformat()
 
     def _init_db(self) -> None:
         with self._conn:
@@ -139,7 +142,7 @@ class SessionManager:
                     workdir = excluded.workdir,
                     updated_at = excluded.updated_at
                 """,
-                (telegram_user_id, str(workdir), _now_iso()),
+                (telegram_user_id, str(workdir), self._now_iso()),
             )
 
     def _persist_session(self, session: Session) -> None:
@@ -189,7 +192,7 @@ class SessionManager:
                     json.dumps(session.tail_lines, ensure_ascii=True),
                     session.tail_partial,
                     1 if session.stop_requested else 0,
-                    _now_iso(),
+                    self._now_iso(),
                 ),
             )
 
@@ -235,7 +238,7 @@ class SessionManager:
 
         recovered_running = 0
         for row in session_rows:
-            started_at = _parse_iso(row["started_at"]) or datetime.utcnow()
+            started_at = _parse_iso(row["started_at"]) or self.now()
             ended_at = _parse_iso(row["ended_at"])
 
             state_raw = str(row["state"])
@@ -247,7 +250,7 @@ class SessionManager:
             if was_running:
                 # Process references cannot survive restart.
                 state = "stopped"
-                ended_at = datetime.utcnow()
+                ended_at = self.now()
                 recovered_running += 1
 
             try:
@@ -303,7 +306,7 @@ class SessionManager:
         sessions = [
             s for s in self.sessions_by_id.values() if s.telegram_user_id == telegram_user_id
         ]
-        sessions.sort(key=lambda s: s.started_at, reverse=True)
+        sessions.sort(key=lambda s: (s.started_at, s.session_id), reverse=True)
         if limit is None:
             return sessions
         return sessions[:limit]
@@ -340,7 +343,7 @@ class SessionManager:
             for s in self.sessions_by_id.values()
             if s.telegram_user_id == telegram_user_id and s.state in {"finished", "failed", "stopped"}
         ]
-        sessions.sort(key=lambda s: s.started_at, reverse=True)
+        sessions.sort(key=lambda s: (s.started_at, s.session_id), reverse=True)
         to_remove = sessions[max_keep:]
         if not to_remove:
             return
@@ -374,6 +377,7 @@ class SessionManager:
             chat_id=chat_id,
             command=command,
             is_attached=True,
+            started_at=self.now(),
         )
         self.sessions_by_id[session_id] = session
         self.active_session_by_user[telegram_user_id] = session_id
@@ -432,7 +436,7 @@ class SessionManager:
             if session.state == "running":
                 session.state = "stopped"
                 session.exit_code = process.returncode
-                session.ended_at = session.ended_at or datetime.utcnow()
+                session.ended_at = session.ended_at or self.now()
             session.process = None
             session.is_attached = False
             session.detached_at = None

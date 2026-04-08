@@ -106,9 +106,18 @@ MAX_SESSION_HISTORY_PER_USER=20
 SESSIONS_PAGE_SIZE=5
 DETACHED_SESSION_TTL_SECONDS=3600
 DETACHED_SWEEP_INTERVAL_SECONDS=30
+TIME_OFFSET=+03:30
 SESSION_DB_PATH=./session_store.sqlite3
 LOG_LEVEL=INFO
 ```
+
+### توضیح `TIME_OFFSET`
+
+- مقدار `TIME_OFFSET` روی زمان‌های نمایشی بات و زمان‌های ذخیره‌شده در SQLite اعمال می‌شود.
+- فرمت آن باید `+HH:MM` یا `-HH:MM` باشد.
+- مثال برای تهران: `TIME_OFFSET=+03:30`.
+- اگر تایم‌زون سرور با تایم‌زون مدنظر شما فرق دارد، این مقدار را حتماً دستی تنظیم کنید.
+- مقدار اشتباه باعث می‌شود `started_at`، `ended_at` و حتی `runtime` ناسازگار دیده شوند.
 
 4. اجرا:
 

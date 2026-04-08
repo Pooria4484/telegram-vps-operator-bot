@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape
 import hashlib
 import logging
@@ -582,9 +582,27 @@ def format_session_result(
     )
 
 
-def format_session_status_message(session: Session, current_dir: Path, stream_enabled: bool) -> str:
-    runtime_end = session.ended_at or datetime.utcnow()
-    runtime = runtime_end - session.started_at
+def format_local_timestamp(value: datetime | None) -> str:
+    if value is None:
+        return "n/a"
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def format_runtime(started_at: datetime, ended_at: datetime | None, now: datetime) -> str:
+    runtime_end = ended_at or now
+    runtime = runtime_end - started_at
+    if runtime.total_seconds() < 0:
+        runtime = timedelta(0)
+    return str(runtime).split(".")[0]
+
+
+def format_session_status_message(
+    session: Session,
+    current_dir: Path,
+    stream_enabled: bool,
+    now: datetime,
+) -> str:
+    runtime = format_runtime(session.started_at, session.ended_at, now)
     pid = session.process.pid if session.process else "n/a"
     stream_mode = "on" if stream_enabled else "off"
     return (
@@ -594,7 +612,9 @@ def format_session_status_message(session: Session, current_dir: Path, stream_en
         f"<b>Attached:</b> <code>{'yes' if session.is_attached else 'no'}</code>\n"
         f"<b>PID:</b> <code>{escape(str(pid))}</code>\n"
         f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
-        f"<b>Runtime:</b> <code>{escape(str(runtime).split('.')[0])}</code>\n"
+        f"<b>Started at:</b> <code>{escape(format_local_timestamp(session.started_at))}</code>\n"
+        f"<b>Ended at:</b> <code>{escape(format_local_timestamp(session.ended_at))}</code>\n"
+        f"<b>Runtime:</b> <code>{escape(runtime)}</code>\n"
         f"<b>Stream mode:</b> <code>{stream_mode}</code>\n"
         f"<b>Exit code:</b> <code>{escape(str(session.exit_code))}</code>"
     )
@@ -717,7 +737,12 @@ def format_tail_message(session: Session, tail_lines: list[str]) -> str:
     )
 
 
-def format_sessions_list_message(sessions: list[Session], max_running: int, running_count: int) -> str:
+def format_sessions_list_message(
+    sessions: list[Session],
+    max_running: int,
+    running_count: int,
+    now: datetime,
+) -> str:
     if not sessions:
         return "<b>No sessions found</b>"
 
@@ -727,14 +752,14 @@ def format_sessions_list_message(sessions: list[Session], max_running: int, runn
         "━━━━━━━━━━━━━━",
     ]
     for session in sessions:
-        runtime_end = session.ended_at or datetime.utcnow()
-        runtime = str((runtime_end - session.started_at)).split(".")[0]
+        runtime = format_runtime(session.started_at, session.ended_at, now)
         attached = "yes" if session.is_attached else "no"
         lines.append(
             f"<b>{escape(session.session_id)}</b> | "
             f"<code>{escape(session.state)}</code> | "
             f"attached=<code>{attached}</code> | "
-            f"runtime=<code>{escape(runtime)}</code>\n"
+            f"runtime=<code>{escape(runtime)}</code> | "
+            f"started=<code>{escape(format_local_timestamp(session.started_at))}</code>\n"
             f"<code>{escape(session.command)}</code>"
         )
     return "\n".join(lines)
@@ -838,7 +863,7 @@ async def wait_session_exit(
         exit_code = await process.wait()
         session.exit_code = exit_code
         session.state = "stopped" if session.stop_requested else ("finished" if exit_code == 0 else "failed")
-        session.ended_at = datetime.utcnow()
+        session.ended_at = session_manager.now()
         logger.info(
             "Session exited: user_id=%s session_id=%s state=%s exit_code=%s command=%r",
             session.telegram_user_id,
@@ -849,7 +874,7 @@ async def wait_session_exit(
         )
     except Exception as exc:
         session.state = "failed"
-        session.ended_at = datetime.utcnow()
+        session.ended_at = session_manager.now()
         session_manager.append_output_text(
             session,
             f"ERROR: {exc!r}\n",
@@ -941,7 +966,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         stream_enabled = session_manager.is_stream_enabled(user_id)
         await message.answer(
-            format_session_status_message(session, current_dir, stream_enabled),
+            format_session_status_message(
+                session,
+                current_dir,
+                stream_enabled,
+                now=session_manager.now(),
+            ),
             parse_mode="HTML",
         )
 
@@ -983,6 +1013,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             sessions=page_sessions,
             max_running=settings.max_running_sessions_per_user,
             running_count=running_count,
+            now=session_manager.now(),
         )
         await message.answer(
             f"{body}\n<b>Page:</b> <code>{page}/{total_pages}</code>",
@@ -1239,7 +1270,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             candidates = session_manager.list_detached_running_sessions()
             if not candidates:
                 continue
-            now = datetime.utcnow()
+            now = session_manager.now()
             for session in candidates:
                 if not is_detached_session_idle_for_ttl(session):
                     if session.detached_at is not None:
@@ -1731,6 +1762,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                         session,
                         current_dir,
                         session_manager.is_stream_enabled(user.id),
+                        now=session_manager.now(),
                     ),
                     parse_mode="HTML",
                 )
@@ -2153,7 +2185,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             )
         except Exception as exc:
             session.state = "failed"
-            session.ended_at = datetime.utcnow()
+            session.ended_at = session_manager.now()
             session_manager.append_output_text(
                 session,
                 f"ERROR: {exc!r}\n",

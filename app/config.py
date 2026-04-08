@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 from dotenv import load_dotenv
 
@@ -31,6 +32,22 @@ def _parse_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _parse_time_offset_minutes(name: str, default: str) -> int:
+    raw = os.getenv(name, default).strip()
+    match = re.fullmatch(r"([+-]?)(\d{1,2}):(\d{2})", raw)
+    if not match:
+        raise RuntimeError(f"{name} must match [+|-]HH:MM")
+    sign_raw, hours_raw, minutes_raw = match.groups()
+    hours = int(hours_raw)
+    minutes = int(minutes_raw)
+    if hours > 23:
+        raise RuntimeError(f"{name} hours must be <= 23")
+    if minutes > 59:
+        raise RuntimeError(f"{name} minutes must be <= 59")
+    sign = -1 if sign_raw == "-" else 1
+    return sign * (hours * 60 + minutes)
+
+
 @dataclass(slots=True)
 class Settings:
     bot_token: str
@@ -44,6 +61,7 @@ class Settings:
     sessions_page_size: int
     detached_session_ttl_seconds: int
     detached_sweep_interval_seconds: int
+    time_offset_minutes: int
     log_level: str
     session_db_path: Path
 
@@ -67,6 +85,7 @@ def load_settings() -> Settings:
         sessions_page_size=_parse_positive_int_env("SESSIONS_PAGE_SIZE", 5),
         detached_session_ttl_seconds=_parse_positive_int_env("DETACHED_SESSION_TTL_SECONDS", 3600),
         detached_sweep_interval_seconds=_parse_positive_int_env("DETACHED_SWEEP_INTERVAL_SECONDS", 30),
+        time_offset_minutes=_parse_time_offset_minutes("TIME_OFFSET", "+03:30"),
         log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
         session_db_path=Path(
             os.getenv("SESSION_DB_PATH", "./session_store.sqlite3")

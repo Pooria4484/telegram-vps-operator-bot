@@ -105,9 +105,18 @@ MAX_SESSION_HISTORY_PER_USER=20
 SESSIONS_PAGE_SIZE=5
 DETACHED_SESSION_TTL_SECONDS=3600
 DETACHED_SWEEP_INTERVAL_SECONDS=30
+TIME_OFFSET=+03:30
 SESSION_DB_PATH=./session_store.sqlite3
 LOG_LEVEL=INFO
 ```
+
+### Time Offset (`TIME_OFFSET`)
+
+- `TIME_OFFSET` is applied to bot timestamps and session times saved in SQLite.
+- It should represent your local timezone difference from UTC in `+HH:MM` or `-HH:MM` format.
+- Example for Tehran: `TIME_OFFSET=+03:30`.
+- If your server timezone differs from your desired display/storage timezone, set this value explicitly.
+- Wrong value can make `started_at`, `ended_at`, and `runtime` appear inconsistent.
 
 4. Run:
 
