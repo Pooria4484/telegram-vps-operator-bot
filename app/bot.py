@@ -492,6 +492,72 @@ def format_session_header(session_id: str, state: str) -> str:
     return f"<b>Session</b> <code>{safe_session_id}</code> | <b>State</b> <code>{safe_state}</code>"
 
 
+def normalize_output_token(token: str) -> str:
+    if len(token) < 2:
+        return token
+
+    normalized = token
+
+    # Trim a trailing comma/semicolon when it is likely punctuation rather than payload.
+    if normalized[-1] in {",", ";"} and len(normalized) > 2:
+        candidate = normalized[:-1]
+        if candidate[-1].isalnum() or candidate[-1] in {'"', "'", "`", ")", "]", "}"}:
+            normalized = candidate
+
+    wrappers = {
+        '"': '"',
+        "'": "'",
+        "`": "`",
+        "(": ")",
+        "[": "]",
+        "{": "}",
+    }
+    left = normalized[0]
+    right = wrappers.get(left)
+    if right and normalized[-1] == right and len(normalized) > 2:
+        inner = normalized[1:-1]
+        if inner:
+            normalized = inner
+
+    return normalized
+
+
+def normalize_output_parts(parts: list[str]) -> list[str]:
+    normalized_parts: list[str] = []
+    i = 0
+    while i < len(parts):
+        part = parts[i]
+        if part and part[0] in {'"', "'", "`"}:
+            quote = part[0]
+            if len(part) >= 2 and part.endswith(quote):
+                normalized_parts.append(normalize_output_token(part))
+                i += 1
+                continue
+
+            end = i + 1
+            while end < len(parts):
+                if parts[end].endswith(quote):
+                    first = part[1:]
+                    middle = parts[i + 1 : end]
+                    last = parts[end][:-1]
+                    joined_parts = [first, *middle, last]
+                    joined = " ".join(item for item in joined_parts if item)
+                    if joined:
+                        normalized_parts.append(normalize_output_token(joined))
+                    i = end + 1
+                    break
+                end += 1
+            else:
+                normalized_parts.append(normalize_output_token(part))
+                i += 1
+            continue
+
+        normalized_parts.append(normalize_output_token(part))
+        i += 1
+
+    return normalized_parts
+
+
 def render_output_lines(output: str) -> str:
     lines = (output or "[no output]").splitlines() or ["[no output]"]
     rendered: list[str] = []
@@ -505,7 +571,8 @@ def render_output_lines(output: str) -> str:
             rendered.append("<code> </code>")
             continue
 
-        rendered.append(" ".join(f"<code>{escape(part)}</code>" for part in parts))
+        normalized_parts = normalize_output_parts(parts)
+        rendered.append(" ".join(f"<code>{escape(part)}</code>" for part in normalized_parts))
     return "\n".join(rendered)
 
 
