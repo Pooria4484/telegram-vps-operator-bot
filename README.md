@@ -52,6 +52,7 @@ Buffer behavior:
 - In stream `on`, buffer is cleared before each new interactive input.
 - In stream `off`, `/tail` shows and consumes (clears) the shown buffer.
 - Stream mode is persisted per user in SQLite until the user changes it.
+- Live stream output uses rolling frames; control buttons stay on the latest live frame only.
 
 ## Quick Action Keyboard
 

@@ -16,6 +16,7 @@ import signal
 import subprocess
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -38,15 +39,15 @@ from app.command_runner import (
 )
 from app.config import Settings
 from app.models import Session
-from app.session_manager import PendingUpload, SessionManager
+from app.session_manager import PendingUpload, SessionManager, sanitize_terminal_text
 
 SESSION_CONTROL_PREFIX = "sessctl"
 CONTEXT_CONTROL_PREFIX = "ctxctl"
 SESSION_LIST_PREFIX = "sesslist"
 SESSION_PAGE_PREFIX = "sesspage"
 KILL_CONFIRM_PREFIX = "killcfm"
-SESSION_STREAM_INTERVAL_SECONDS = 2.0
-SESSION_STREAM_MAX_LINES = 20
+SESSION_STREAM_INTERVAL_SECONDS = 1.0
+STREAM_FRAME_MAX_BODY_CHARS = 2400
 logger = logging.getLogger(__name__)
 
 BTN_STATUS = "Status"
@@ -226,6 +227,22 @@ def session_control_keyboard_output(session_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="Back", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_main:{session_id}"),
+            ],
+        ]
+    )
+
+
+def stream_frame_keyboard(session_id: str, stream_enabled: bool) -> InlineKeyboardMarkup:
+    stream_label = "Stream: ON" if stream_enabled else "Stream: OFF"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Status", callback_data=f"{SESSION_CONTROL_PREFIX}:status:{session_id}"),
+                InlineKeyboardButton(text="Tail", callback_data=f"{SESSION_CONTROL_PREFIX}:tail:{session_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Stop", callback_data=f"{SESSION_CONTROL_PREFIX}:stop:{session_id}"),
+                InlineKeyboardButton(text=stream_label, callback_data=f"{SESSION_CONTROL_PREFIX}:stream_toggle:{session_id}"),
             ],
         ]
     )
@@ -762,6 +779,159 @@ def format_sessions_list_message(
     return "\n".join(lines)
 
 
+def reset_stream_frame_state(session: Session) -> None:
+    session.stream_pending_text = ""
+    session.stream_live_message_id = None
+    session.stream_frame_index = 0
+    session.stream_frame_body = ""
+    session.stream_current_line_start = 0
+    session.stream_last_sent_text = ""
+
+
+def reset_stream_state_for_new_input(session: Session, session_manager: SessionManager) -> None:
+    # Stream-on policy: every new interactive input starts from a fresh buffer/frame.
+    session_manager.clear_output_buffer(session)
+    reset_stream_frame_state(session)
+    session_manager.save_session(session)
+
+
+def build_stream_frame_text(session: Session, now: datetime) -> str:
+    frame_no = max(1, session.stream_frame_index)
+    body = session.stream_frame_body if session.stream_frame_body else "[no output yet]"
+    return (
+        f"{format_session_header(session.session_id, session.state)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"<b>Live Frame:</b> <code>{frame_no}</code>\n"
+        f"<b>Updated:</b> <code>{escape(format_local_timestamp(now))}</code>\n"
+        f"{render_output_lines(body)}"
+    )
+
+
+async def upsert_stream_frame_message(
+    session: Session,
+    bot: Bot,
+    now: datetime,
+    stream_enabled: bool,
+) -> None:
+    text = build_stream_frame_text(session, now=now)
+    keyboard = stream_frame_keyboard(session.session_id, stream_enabled=stream_enabled)
+    if text == session.stream_last_sent_text:
+        return
+    if session.stream_live_message_id is None:
+        if session.stream_frame_index < 1:
+            session.stream_frame_index = 1
+        sent = await bot.send_message(
+            session.chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        session.stream_live_message_id = sent.message_id
+        session.stream_last_sent_text = text
+        return
+
+    old_message_id = session.stream_live_message_id
+
+    try:
+        await bot.edit_message_text(
+            chat_id=session.chat_id,
+            message_id=old_message_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        session.stream_last_sent_text = text
+    except TelegramBadRequest as exc:
+        lowered = str(exc).lower()
+        if "message is not modified" in lowered:
+            session.stream_last_sent_text = text
+            return
+        with contextlib.suppress(Exception):
+            await bot.edit_message_reply_markup(
+                chat_id=session.chat_id,
+                message_id=old_message_id,
+                reply_markup=None,
+            )
+        sent = await bot.send_message(
+            session.chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        session.stream_live_message_id = sent.message_id
+        session.stream_last_sent_text = text
+    except TelegramRetryAfter as exc:
+        await asyncio.sleep(float(exc.retry_after))
+        try:
+            await bot.edit_message_text(
+                chat_id=session.chat_id,
+                message_id=old_message_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            session.stream_last_sent_text = text
+        except Exception:
+            with contextlib.suppress(Exception):
+                await bot.edit_message_reply_markup(
+                    chat_id=session.chat_id,
+                    message_id=old_message_id,
+                    reply_markup=None,
+                )
+            sent = await bot.send_message(
+                session.chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=keyboard,
+            )
+            session.stream_live_message_id = sent.message_id
+            session.stream_last_sent_text = text
+    except TelegramForbiddenError:
+        return
+    except Exception:
+        # Fallback for stale/deleted/unchanged messages: emit a fresh frame message.
+        with contextlib.suppress(Exception):
+            await bot.edit_message_reply_markup(
+                chat_id=session.chat_id,
+                message_id=old_message_id,
+                reply_markup=None,
+            )
+        sent = await bot.send_message(
+            session.chat_id,
+            text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        session.stream_live_message_id = sent.message_id
+        session.stream_last_sent_text = text
+
+
+async def stream_rollover_frame(
+    session: Session,
+    bot: Bot,
+    now: datetime,
+    stream_enabled: bool,
+) -> None:
+    await upsert_stream_frame_message(
+        session,
+        bot,
+        now=now,
+        stream_enabled=stream_enabled,
+    )
+    if session.stream_live_message_id is not None:
+        with contextlib.suppress(Exception):
+            await bot.edit_message_reply_markup(
+                chat_id=session.chat_id,
+                message_id=session.stream_live_message_id,
+                reply_markup=None,
+            )
+    session.stream_live_message_id = None
+    session.stream_frame_body = ""
+    session.stream_current_line_start = 0
+    session.stream_last_sent_text = ""
+    session.stream_frame_index = max(1, session.stream_frame_index) + 1
+
+
 async def read_session_output(
     session: Session,
     session_manager: SessionManager,
@@ -794,11 +964,15 @@ async def read_session_output(
             chunk = await queue.get()
             if chunk is None:
                 break
+            text_chunk = chunk.decode(errors="replace")
             session_manager.append_output_text(
                 session,
-                chunk.decode(errors="replace"),
+                text_chunk,
                 max_tail_lines,
             )
+            if session_manager.is_stream_enabled(session.telegram_user_id):
+                normalized = sanitize_terminal_text(text_chunk).replace("\r\n", "\n")
+                session.stream_pending_text += normalized
     finally:
         with contextlib.suppress(Exception):
             loop.remove_reader(master_fd)
@@ -810,7 +984,6 @@ async def read_session_output(
 async def stream_session_output(
     session: Session,
     session_manager: SessionManager,
-    settings: Settings,
     bot: Bot,
 ) -> None:
     while True:
@@ -823,25 +996,38 @@ async def stream_session_output(
         if not session_manager.is_stream_enabled(session.telegram_user_id):
             continue
 
-        tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
-        if not tail_lines:
+        now = session_manager.now()
+        stream_enabled = session_manager.is_stream_enabled(session.telegram_user_id)
+        pending = session.stream_pending_text
+        if not pending:
             continue
+        session.stream_pending_text = ""
 
-        snapshot_lines = tail_lines[-SESSION_STREAM_MAX_LINES:]
-        snapshot_text = "\n".join(snapshot_lines)
-        if snapshot_text == session.stream_last_sent_text:
-            continue
+        for char in pending:
+            if char == "\r":
+                session.stream_frame_body = session.stream_frame_body[: session.stream_current_line_start]
+                continue
 
-        session.stream_last_sent_text = snapshot_text
-        stream_message = (
-            f"{format_session_header(session.session_id, session.state)}\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"<b>Live stream</b>\n"
-            f"{render_output_lines(snapshot_text)}"
-        )
+            if len(session.stream_frame_body) + 1 > STREAM_FRAME_MAX_BODY_CHARS:
+                await stream_rollover_frame(
+                    session,
+                    bot,
+                    now=now,
+                    stream_enabled=stream_enabled,
+                )
+
+            session.stream_frame_body += char
+            if char == "\n":
+                session.stream_current_line_start = len(session.stream_frame_body)
 
         with contextlib.suppress(Exception):
-            await bot.send_message(session.chat_id, stream_message, parse_mode="HTML")
+            await upsert_stream_frame_message(
+                session,
+                bot,
+                now=now,
+                stream_enabled=stream_enabled,
+            )
+        session_manager.save_session(session)
 
 
 async def wait_session_exit(
@@ -1186,7 +1372,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         if session_manager.is_stream_enabled(user_id):
-            session_manager.clear_output_buffer(session)
+            reset_stream_state_for_new_input(session, session_manager)
         if not send_ctrl_c(process):
             await message.answer("Could not send Ctrl+C. Process is no longer running.")
             return
@@ -1206,7 +1392,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         if session_manager.is_stream_enabled(user_id):
-            session_manager.clear_output_buffer(session)
+            reset_stream_state_for_new_input(session, session_manager)
         if not send_pty_input(master_fd, b"\x04"):
             await message.answer("Could not send Ctrl+D. PTY is no longer available.")
             return
@@ -1226,7 +1412,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         if session_manager.is_stream_enabled(user_id):
-            session_manager.clear_output_buffer(session)
+            reset_stream_state_for_new_input(session, session_manager)
         if not send_pty_input(master_fd, b"\n"):
             await message.answer("Could not send Enter. PTY is no longer available.")
             return
@@ -1249,11 +1435,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         else:
             enabled = mode == "on"
         session_manager.set_stream_enabled(user_id, enabled)
-        if enabled:
-            session = session_manager.get_active_session_for_user(user_id)
-            if session:
+        session = session_manager.get_active_session_for_user(user_id)
+        if session:
+            reset_stream_frame_state(session)
+            if enabled:
                 session_manager.clear_output_buffer(session)
-                session.stream_last_sent_text = ""
+            session_manager.save_session(session)
         state_text = "enabled" if enabled else "disabled"
         await message.answer(f"Stream mode {state_text}.", parse_mode="HTML")
 
@@ -1776,8 +1963,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if action == "stream_toggle":
             enabled = not session_manager.is_stream_enabled(user.id)
             session_manager.set_stream_enabled(user.id, enabled)
+            reset_stream_frame_state(session)
             if enabled:
-                session.stream_last_sent_text = ""
+                session_manager.clear_output_buffer(session)
+            session_manager.save_session(session)
             mode_text = "on" if enabled else "off"
             await callback.answer(f"Stream: {mode_text}.", show_alert=False)
             return
@@ -1810,7 +1999,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 return
 
             if session_manager.is_stream_enabled(user.id):
-                session_manager.clear_output_buffer(session)
+                reset_stream_state_for_new_input(session, session_manager)
             if not send_ctrl_c(process):
                 await callback.answer("Process is not running.", show_alert=False)
                 return
@@ -1824,7 +2013,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         if action in {"ctrl_d", "enter"} and session_manager.is_stream_enabled(user.id):
-            session_manager.clear_output_buffer(session)
+            reset_stream_state_for_new_input(session, session_manager)
         payload = b"\x04" if action == "ctrl_d" else b"\n"
         action_name = "Ctrl+D" if action == "ctrl_d" else "Enter"
         if not send_pty_input(master_fd, payload):
@@ -2200,14 +2389,14 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         session.state = "running"
         session.process = live.process
         session.pty_master_fd = live.pty_master_fd
-        session.stream_last_sent_text = ""
+        reset_stream_frame_state(session)
         session.is_attached = True
         session_manager.save_session(session)
         session.reader_task = asyncio.create_task(
             read_session_output(session, session_manager, settings.max_tail_lines)
         )
         session.streamer_task = asyncio.create_task(
-            stream_session_output(session, session_manager, settings, message.bot)
+            stream_session_output(session, session_manager, message.bot)
         )
         session.waiter_task = asyncio.create_task(
             wait_session_exit(session, session_manager, settings, message.bot)
@@ -2252,7 +2441,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 return
 
             if session_manager.is_stream_enabled(user.id):
-                session_manager.clear_output_buffer(session)
+                reset_stream_state_for_new_input(session, session_manager)
             data = text.encode(errors="replace") + b"\n"
             if not send_pty_input(master_fd, data):
                 await message.answer("Could not send text to active session.")

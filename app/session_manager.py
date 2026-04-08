@@ -100,6 +100,12 @@ class SessionManager:
                     exit_code INTEGER,
                     tail_lines_json TEXT NOT NULL,
                     tail_partial TEXT NOT NULL,
+                    stream_pending_text TEXT NOT NULL DEFAULT '',
+                    stream_live_message_id INTEGER,
+                    stream_frame_index INTEGER NOT NULL DEFAULT 0,
+                    stream_frame_body TEXT NOT NULL DEFAULT '',
+                    stream_current_line_start INTEGER NOT NULL DEFAULT 0,
+                    stream_last_sent_text TEXT NOT NULL DEFAULT '',
                     stop_requested INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 )
@@ -131,6 +137,36 @@ class SessionManager:
             table="session_snapshots",
             column="detached_at",
             sql="ALTER TABLE session_snapshots ADD COLUMN detached_at TEXT",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="stream_pending_text",
+            sql="ALTER TABLE session_snapshots ADD COLUMN stream_pending_text TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="stream_live_message_id",
+            sql="ALTER TABLE session_snapshots ADD COLUMN stream_live_message_id INTEGER",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="stream_frame_index",
+            sql="ALTER TABLE session_snapshots ADD COLUMN stream_frame_index INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="stream_frame_body",
+            sql="ALTER TABLE session_snapshots ADD COLUMN stream_frame_body TEXT NOT NULL DEFAULT ''",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="stream_current_line_start",
+            sql="ALTER TABLE session_snapshots ADD COLUMN stream_current_line_start INTEGER NOT NULL DEFAULT 0",
+        )
+        self._ensure_column(
+            table="session_snapshots",
+            column="stream_last_sent_text",
+            sql="ALTER TABLE session_snapshots ADD COLUMN stream_last_sent_text TEXT NOT NULL DEFAULT ''",
         )
 
     def _ensure_column(self, table: str, column: str, sql: str) -> None:
@@ -190,9 +226,15 @@ class SessionManager:
                     exit_code,
                     tail_lines_json,
                     tail_partial,
+                    stream_pending_text,
+                    stream_live_message_id,
+                    stream_frame_index,
+                    stream_frame_body,
+                    stream_current_line_start,
+                    stream_last_sent_text,
                     stop_requested,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id) DO UPDATE SET
                     is_attached = excluded.is_attached,
                     detached_at = excluded.detached_at,
@@ -201,6 +243,12 @@ class SessionManager:
                     exit_code = excluded.exit_code,
                     tail_lines_json = excluded.tail_lines_json,
                     tail_partial = excluded.tail_partial,
+                    stream_pending_text = excluded.stream_pending_text,
+                    stream_live_message_id = excluded.stream_live_message_id,
+                    stream_frame_index = excluded.stream_frame_index,
+                    stream_frame_body = excluded.stream_frame_body,
+                    stream_current_line_start = excluded.stream_current_line_start,
+                    stream_last_sent_text = excluded.stream_last_sent_text,
                     stop_requested = excluded.stop_requested,
                     updated_at = excluded.updated_at
                 """,
@@ -217,6 +265,12 @@ class SessionManager:
                     session.exit_code,
                     json.dumps(session.tail_lines, ensure_ascii=True),
                     session.tail_partial,
+                    session.stream_pending_text,
+                    session.stream_live_message_id,
+                    session.stream_frame_index,
+                    session.stream_frame_body,
+                    session.stream_current_line_start,
+                    session.stream_last_sent_text,
                     1 if session.stop_requested else 0,
                     self._now_iso(),
                 ),
@@ -262,6 +316,12 @@ class SessionManager:
                 exit_code,
                 tail_lines_json,
                 tail_partial,
+                stream_pending_text,
+                stream_live_message_id,
+                stream_frame_index,
+                stream_frame_body,
+                stream_current_line_start,
+                stream_last_sent_text,
                 stop_requested
             FROM session_snapshots
             ORDER BY started_at ASC
@@ -305,8 +365,23 @@ class SessionManager:
                 exit_code=row["exit_code"],
                 tail_lines=tail_lines,
                 tail_partial=str(row["tail_partial"] or ""),
+                stream_pending_text=str(row["stream_pending_text"] or ""),
+                stream_live_message_id=row["stream_live_message_id"],
+                stream_frame_index=int(row["stream_frame_index"] or 0),
+                stream_frame_body=str(row["stream_frame_body"] or ""),
+                stream_current_line_start=int(row["stream_current_line_start"] or 0),
+                stream_last_sent_text=str(row["stream_last_sent_text"] or ""),
                 stop_requested=bool(row["stop_requested"]),
             )
+
+            if was_running:
+                # Live frame messages from previous process lifetime are stale after restart.
+                session.stream_pending_text = ""
+                session.stream_live_message_id = None
+                session.stream_frame_body = ""
+                session.stream_current_line_start = 0
+                session.stream_last_sent_text = ""
+
             self.sessions_by_id[session.session_id] = session
 
             if session.state == "stopped" and session.tail_partial:

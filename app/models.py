@@ -32,3 +32,8 @@ class Session:
     waiter_task: asyncio.Task[None] | None = None
     streamer_task: asyncio.Task[None] | None = None
     stream_last_sent_text: str = ""
+    stream_pending_text: str = ""
+    stream_live_message_id: int | None = None
+    stream_frame_index: int = 0
+    stream_frame_body: str = ""
+    stream_current_line_start: int = 0
