@@ -55,8 +55,8 @@ BTN_STOP = "Stop"
 BTN_SESSIONS = "Sessions"
 BTN_DETACH = "Detach"
 BTN_CTRL_C = "Ctrl+C"
+BTN_CTRL_D = "Ctrl+D"
 BTN_ENTER = "Enter"
-BTN_CLEAR = "Clear"
 BTN_STREAM = "Stream"
 BTN_HELP = "Help"
 
@@ -67,8 +67,8 @@ QUICK_ACTION_BY_TEXT: dict[str, str] = {
     BTN_SESSIONS: "sessions",
     BTN_DETACH: "detach",
     BTN_CTRL_C: "ctrl_c",
+    BTN_CTRL_D: "ctrl_d",
     BTN_ENTER: "enter",
-    BTN_CLEAR: "clear",
     BTN_STREAM: "stream_toggle",
     BTN_HELP: "help",
 }
@@ -173,11 +173,11 @@ def persistent_control_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text=BTN_DETACH),
                 KeyboardButton(text=BTN_CTRL_C),
+                KeyboardButton(text=BTN_CTRL_D),
                 KeyboardButton(text=BTN_ENTER),
-                KeyboardButton(text=BTN_STREAM),
             ],
             [
-                KeyboardButton(text=BTN_CLEAR),
+                KeyboardButton(text=BTN_STREAM),
                 KeyboardButton(text=BTN_HELP),
             ],
         ],
@@ -223,7 +223,6 @@ def session_control_keyboard_output(session_id: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Tail", callback_data=f"{SESSION_CONTROL_PREFIX}:tail:{session_id}"),
                 InlineKeyboardButton(text="Stream", callback_data=f"{SESSION_CONTROL_PREFIX}:stream_toggle:{session_id}"),
-                InlineKeyboardButton(text="Clear", callback_data=f"{SESSION_CONTROL_PREFIX}:clear:{session_id}"),
             ],
             [
                 InlineKeyboardButton(text="Back", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_main:{session_id}"),
@@ -395,7 +394,6 @@ def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
         "tail",
         "status",
         "stream_toggle",
-        "clear",
         "menu_main",
         "menu_controls",
         "menu_output",
@@ -422,7 +420,6 @@ def bot_command_menu() -> list[BotCommand]:
         BotCommand(command="kill", description="Kill a running session"),
         BotCommand(command="ctrl", description="Send Ctrl+C or Ctrl+D"),
         BotCommand(command="n", description="Send Enter/newline"),
-        BotCommand(command="clear", description="Clear output buffer"),
         BotCommand(command="stream", description="Stream on/off/toggle/status"),
         BotCommand(command="live", description="Alias for /stream"),
         BotCommand(command="get", description="Download file from VPS"),
@@ -529,7 +526,7 @@ async def answer_active_session_exists(message: Message, session_id: str) -> Non
         f"<b>How to continue:</b> send plain text (example: <code>ls</code>)\n"
         f"<b>Detach first:</b> <code>/detach</code>\n"
         f"<b>Controls:</b> <code>/n</code>, <code>/ctrl c</code>, <code>/ctrl d</code>, <code>/tail</code>, "
-        f"<code>/status</code>, <code>/stop</code>, <code>/clear</code>\n"
+        f"<code>/status</code>, <code>/stop</code>\n"
         f"<b>Session list:</b> <code>/sessions</code>\n"
         f"<b>Stream toggle:</b> <code>/stream toggle</code> (or on/off)",
         parse_mode="HTML",
@@ -557,7 +554,7 @@ def format_live_start_message(
         f"(toggle with <code>/stream toggle</code>)\n"
         f"<b>Interactive:</b> send plain text to active session (example: <code>ls</code>)\n"
         f"<b>Tip:</b> use <code>/tail</code>, <code>/status</code>, <code>/stop</code>, "
-        f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/clear</code>, <code>/stream status</code>"
+        f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/stream status</code>"
     )
 
 
@@ -659,10 +656,10 @@ def format_help_message(current_dir: Path) -> str:
         "  مثال: <code>/n</code>\n"
         "• <code>/stream on|off|toggle|status</code>: کنترل پخش زنده خروجی\n"
         "  مثال‌ها: <code>/stream on</code> | <code>/stream toggle</code>\n"
+        "  نکته: در حالت on قبل از هر ورودی جدید بافر پاک می‌شود.\n"
+        "  نکته: در حالت off با <code>/tail</code> بافر نمایش‌داده‌شده مصرف می‌شود.\n"
         "• <code>/live ...</code>: نام جایگزین برای stream\n"
         "  مثال: <code>/live status</code>\n"
-        "• <code>/clear</code>: پاک کردن بافر خروجی سشن فعال\n"
-        "  مثال: <code>/clear</code>\n"
         "• <code>/get &lt;path&gt;</code>: دریافت فایل از سرور\n"
         "  مثال: <code>/get logs/app.log</code>\n"
         "• ارسال فایل: آپلود فایل در مسیر کاری فعلی شما\n"
@@ -704,10 +701,10 @@ def format_help_message(current_dir: Path) -> str:
         "  Example: <code>/n</code>\n"
         "• <code>/stream on|off|toggle|status</code>: live output control\n"
         "  Examples: <code>/stream off</code> | <code>/stream status</code>\n"
+        "  Note: in on mode, buffer is cleared before each new input.\n"
+        "  Note: in off mode, <code>/tail</code> consumes the shown buffer.\n"
         "• <code>/live ...</code>: alias for <code>/stream ...</code>\n"
         "  Example: <code>/live on</code>\n"
-        "• <code>/clear</code>: clear output buffer\n"
-        "  Example: <code>/clear</code>\n"
         "• <code>/get &lt;path&gt;</code>: download file from VPS\n"
         "  Example: <code>/get /etc/hosts</code>\n"
         "• File upload: send a file directly in chat\n"
@@ -996,6 +993,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
         await message.answer(format_tail_message(session, tail_lines), parse_mode="HTML")
+        if not session_manager.is_stream_enabled(user_id):
+            session_manager.clear_output_buffer(session)
 
     async def do_sessions(message: Message, user_id: int, page: int = 1) -> None:
         sessions = session_manager.list_sessions_for_user(user_id, limit=None)
@@ -1186,6 +1185,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await message.answer("No live process is attached to the active session.")
             return
 
+        if session_manager.is_stream_enabled(user_id):
+            session_manager.clear_output_buffer(session)
         if not send_ctrl_c(process):
             await message.answer("Could not send Ctrl+C. Process is no longer running.")
             return
@@ -1204,6 +1205,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await message.answer("No active PTY is attached to the session.")
             return
 
+        if session_manager.is_stream_enabled(user_id):
+            session_manager.clear_output_buffer(session)
         if not send_pty_input(master_fd, b"\x04"):
             await message.answer("Could not send Ctrl+D. PTY is no longer available.")
             return
@@ -1222,24 +1225,13 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await message.answer("No active PTY is attached to the session.")
             return
 
+        if session_manager.is_stream_enabled(user_id):
+            session_manager.clear_output_buffer(session)
         if not send_pty_input(master_fd, b"\n"):
             await message.answer("Could not send Enter. PTY is no longer available.")
             return
 
         await message.answer(f"Sent Enter to session {session.session_id}.")
-
-    async def do_clear(message: Message, user_id: int) -> None:
-        current_dir = session_manager.get_current_workdir(user_id)
-        session = session_manager.get_active_session_for_user(user_id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
-        session_manager.clear_output_buffer(session)
-        await message.answer(
-            f"Output buffer cleared for session <code>{escape(session.session_id)}</code>.",
-            parse_mode="HTML",
-        )
 
     async def do_stream_mode(message: Message, user_id: int, mode: str) -> None:
         if mode not in {"on", "off", "toggle", "status"}:
@@ -1260,6 +1252,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if enabled:
             session = session_manager.get_active_session_for_user(user_id)
             if session:
+                session_manager.clear_output_buffer(session)
                 session.stream_last_sent_text = ""
         state_text = "enabled" if enabled else "disabled"
         await message.answer(f"Stream mode {state_text}.", parse_mode="HTML")
@@ -1345,7 +1338,6 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "/kill [session_id]\n"
             "/ctrl <c|d>\n"
             "/n\n"
-            "/clear\n"
             "/stream <on|off|toggle|status> (alias: /live)\n"
             "/get <path>\n"
             "/status [session_id]\n"
@@ -1776,6 +1768,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                     format_tail_message(session, tail_lines),
                     parse_mode="HTML",
                 )
+            if not session_manager.is_stream_enabled(user.id):
+                session_manager.clear_output_buffer(session)
             await callback.answer("Tail sent.", show_alert=False)
             return
 
@@ -1786,11 +1780,6 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 session.stream_last_sent_text = ""
             mode_text = "on" if enabled else "off"
             await callback.answer(f"Stream: {mode_text}.", show_alert=False)
-            return
-
-        if action == "clear":
-            session_manager.clear_output_buffer(session)
-            await callback.answer("Output cleared.", show_alert=False)
             return
 
         if action == "stop":
@@ -1820,6 +1809,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 await callback.answer("No live process.", show_alert=False)
                 return
 
+            if session_manager.is_stream_enabled(user.id):
+                session_manager.clear_output_buffer(session)
             if not send_ctrl_c(process):
                 await callback.answer("Process is not running.", show_alert=False)
                 return
@@ -1832,6 +1823,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await callback.answer("No active PTY.", show_alert=False)
             return
 
+        if action in {"ctrl_d", "enter"} and session_manager.is_stream_enabled(user.id):
+            session_manager.clear_output_buffer(session)
         payload = b"\x04" if action == "ctrl_d" else b"\n"
         action_name = "Ctrl+D" if action == "ctrl_d" else "Enter"
         if not send_pty_input(master_fd, payload):
@@ -1994,14 +1987,6 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         await do_enter(message, user.id)
 
-    @dp.message(Command("clear"))
-    async def clear_output_handler(message: Message) -> None:
-        user = message.from_user
-        if not user or not is_allowed(user.id, settings):
-            return
-
-        await do_clear(message, user.id)
-
     @dp.message(Command(commands=["stream", "live"]))
     async def stream_mode_handler(message: Message) -> None:
         user = message.from_user
@@ -2042,11 +2027,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if action == "ctrl_c":
             await do_ctrl_c(message, user.id)
             return
+        if action == "ctrl_d":
+            await do_ctrl_d(message, user.id)
+            return
         if action == "enter":
             await do_enter(message, user.id)
-            return
-        if action == "clear":
-            await do_clear(message, user.id)
             return
         if action == "stream_toggle":
             await do_stream_mode(message, user.id, "toggle")
@@ -2266,6 +2251,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             if not text:
                 return
 
+            if session_manager.is_stream_enabled(user.id):
+                session_manager.clear_output_buffer(session)
             data = text.encode(errors="replace") + b"\n"
             if not send_pty_input(master_fd, data):
                 await message.answer("Could not send text to active session.")

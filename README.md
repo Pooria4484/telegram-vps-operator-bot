@@ -14,6 +14,7 @@ This project focuses on practical VPS workflows:
 
 - Whitelist access control via `ALLOWED_USER_IDS`
 - Per-user working directory persistence
+- Per-user preference persistence (for example stream mode on/off)
 - Live PTY sessions (one active session per user)
 - Session controls: stop, Ctrl+C, Ctrl+D, Enter
 - Output tail buffer with ANSI/control-sequence sanitization
@@ -43,10 +44,14 @@ This project focuses on practical VPS workflows:
 - `/ctrl c` Send Ctrl+C to active process group
 - `/ctrl d` Send Ctrl+D (EOF) to active PTY
 - `/n` Send Enter/newline to active PTY
-- `/clear` Clear active session output buffer
 - `/stream on|off|toggle|status` Control stream mode
 - `/live ...` Alias for `/stream ...`
 - `/get <path>` Download file from VPS
+
+Buffer behavior:
+- In stream `on`, buffer is cleared before each new interactive input.
+- In stream `off`, `/tail` shows and consumes (clears) the shown buffer.
+- Stream mode is persisted per user in SQLite until the user changes it.
 
 ## Quick Action Keyboard
 
@@ -57,8 +62,8 @@ Current quick actions shown in chat keyboard:
 - `Stop`
 - `Detach`
 - `Ctrl+C`
+- `Ctrl+D`
 - `Enter`
-- `Clear`
 - `Stream`
 - `Help`
 

@@ -111,6 +111,15 @@ class SessionManager:
                 ON session_snapshots (telegram_user_id, started_at DESC)
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    telegram_user_id INTEGER PRIMARY KEY,
+                    stream_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
 
         # Lightweight migrations for existing DBs.
         self._ensure_column(
@@ -143,6 +152,23 @@ class SessionManager:
                     updated_at = excluded.updated_at
                 """,
                 (telegram_user_id, str(workdir), self._now_iso()),
+            )
+
+    def _persist_stream_preference(self, telegram_user_id: int, enabled: bool) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO user_preferences (telegram_user_id, stream_enabled, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                    stream_enabled = excluded.stream_enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    telegram_user_id,
+                    1 if enabled else 0,
+                    self._now_iso(),
+                ),
             )
 
     def _persist_session(self, session: Session) -> None:
@@ -212,6 +238,13 @@ class SessionManager:
                     row["telegram_user_id"],
                     row["workdir"],
                 )
+
+        pref_rows = self._conn.execute(
+            "SELECT telegram_user_id, stream_enabled FROM user_preferences"
+        ).fetchall()
+        for row in pref_rows:
+            user_id = int(row["telegram_user_id"])
+            self.stream_enabled_by_user[user_id] = bool(row["stream_enabled"])
 
         # Load session history for continuity after restart.
         session_rows = self._conn.execute(
@@ -535,3 +568,4 @@ class SessionManager:
 
     def set_stream_enabled(self, telegram_user_id: int, enabled: bool) -> None:
         self.stream_enabled_by_user[telegram_user_id] = enabled
+        self._persist_stream_preference(telegram_user_id, enabled)
