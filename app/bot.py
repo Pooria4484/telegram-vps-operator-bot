@@ -869,13 +869,15 @@ def reset_stream_state_for_new_input(session: Session, session_manager: SessionM
 def build_stream_frame_text(session: Session, now: datetime) -> str:
     frame_no = max(1, session.stream_frame_index)
     body = session.stream_frame_body if session.stream_frame_body else "[no output yet]"
-    return (
-        f"{format_session_header(session.session_id, session.state)}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"<b>Live Frame:</b> <code>{frame_no}</code>\n"
-        f"<b>Updated:</b> <code>{escape(format_local_timestamp(now))}</code>\n"
-        f"{render_output_lines(body)}"
-    )
+    if frame_no == 1:
+        return (
+            f"{format_session_header(session.session_id, session.state)}\n"
+            f"━━━━━━━━━━━━━━\n"
+            f"<b>Live Frame:</b> <code>{frame_no}</code>\n"
+            f"<b>Updated:</b> <code>{escape(format_local_timestamp(now))}</code>\n"
+            f"{render_output_lines(body)}"
+        )
+    return render_output_lines(body)
 
 
 async def upsert_stream_frame_message(
@@ -1080,12 +1082,26 @@ async def stream_session_output(
                 continue
 
             if len(session.stream_frame_body) + 1 > STREAM_FRAME_MAX_BODY_CHARS:
-                await stream_rollover_frame(
-                    session,
-                    bot,
-                    now=now,
-                    stream_enabled=stream_enabled,
-                )
+                # Prefer rolling at line boundaries to keep output readable.
+                if 0 < session.stream_current_line_start < len(session.stream_frame_body):
+                    carry = session.stream_frame_body[session.stream_current_line_start :]
+                    session.stream_frame_body = session.stream_frame_body[: session.stream_current_line_start]
+                    await stream_rollover_frame(
+                        session,
+                        bot,
+                        now=now,
+                        stream_enabled=stream_enabled,
+                    )
+                    session.stream_frame_body = carry
+                    session.stream_current_line_start = 0
+                else:
+                    # Fallback for very long single-line output without newline.
+                    await stream_rollover_frame(
+                        session,
+                        bot,
+                        now=now,
+                        stream_enabled=stream_enabled,
+                    )
 
             session.stream_frame_body += char
             if char == "\n":
