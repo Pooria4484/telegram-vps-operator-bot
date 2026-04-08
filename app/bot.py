@@ -38,6 +38,7 @@ from app.models import Session
 from app.session_manager import PendingUpload, SessionManager
 
 SESSION_CONTROL_PREFIX = "sessctl"
+CONTEXT_CONTROL_PREFIX = "ctxctl"
 SESSION_STREAM_INTERVAL_SECONDS = 2.0
 SESSION_STREAM_MAX_LINES = 20
 
@@ -192,6 +193,40 @@ def session_control_keyboard_output(session_id: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def context_control_keyboard(*actions: str) -> InlineKeyboardMarkup:
+    label_by_action = {
+        "help": "Help",
+        "status": "Status",
+        "tail": "Tail",
+    }
+    buttons: list[InlineKeyboardButton] = []
+    for action in actions:
+        label = label_by_action.get(action)
+        if not label:
+            continue
+        buttons.append(
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"{CONTEXT_CONTROL_PREFIX}:{action}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else InlineKeyboardMarkup(inline_keyboard=[])
+
+
+def parse_context_control_callback(data: str | None) -> str | None:
+    if not data:
+        return None
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return None
+    prefix, action = parts
+    if prefix != CONTEXT_CONTROL_PREFIX:
+        return None
+    if action not in {"help", "status", "tail"}:
+        return None
+    return action
 
 
 def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
@@ -844,7 +879,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         text = (message.text or "").strip()
         parts = text.split(maxsplit=1)
         if len(parts) < 2 or not parts[1].strip():
-            await message.answer("Usage: /get <path>")
+            await message.answer(
+                "Usage: /get <path>",
+                reply_markup=context_control_keyboard("help", "status"),
+            )
             return
 
         current_dir = session_manager.get_current_workdir(user.id)
@@ -858,6 +896,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
                 f"<b>Reason:</b> <code>path does not exist</code>",
                 parse_mode="HTML",
+                reply_markup=context_control_keyboard("status", "help"),
             )
             return
 
@@ -868,6 +907,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
                 f"<b>Reason:</b> <code>path is not a file</code>",
                 parse_mode="HTML",
+                reply_markup=context_control_keyboard("status", "help"),
             )
             return
 
@@ -892,6 +932,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
                 f"<b>Error:</b> <code>{escape(str(exc))}</code>",
                 parse_mode="HTML",
+                reply_markup=context_control_keyboard("status", "help"),
             )
 
     @dp.message(F.document)
@@ -1168,6 +1209,33 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         await callback.answer(f"{action_name} sent.", show_alert=False)
 
+    @dp.callback_query(F.data.startswith(f"{CONTEXT_CONTROL_PREFIX}:"))
+    async def context_control_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        action = parse_context_control_callback(callback.data)
+        if not action:
+            await callback.answer("Invalid action.", show_alert=False)
+            return
+
+        if not callback.message:
+            await callback.answer("No message context.", show_alert=False)
+            return
+
+        if action == "help":
+            await do_help(callback.message, user.id)
+            await callback.answer("Help sent.", show_alert=False)
+            return
+        if action == "status":
+            await do_status(callback.message, user.id)
+            await callback.answer("Status sent.", show_alert=False)
+            return
+
+        await do_tail(callback.message, user.id)
+        await callback.answer("Tail sent.", show_alert=False)
+
     @dp.message(Command("stop"))
     async def stop_handler(message: Message) -> None:
         user = message.from_user
@@ -1185,12 +1253,18 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         text = (message.text or "").strip()
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Usage: /ctrl <c|d>")
+            await message.answer(
+                "Usage: /ctrl <c|d>",
+                reply_markup=context_control_keyboard("help", "status"),
+            )
             return
 
         action = parts[1].strip().lower()
         if action not in {"c", "d"}:
-            await message.answer("Usage: /ctrl <c|d>")
+            await message.answer(
+                "Usage: /ctrl <c|d>",
+                reply_markup=context_control_keyboard("help", "status"),
+            )
             return
 
         if action == "c":
@@ -1268,12 +1342,18 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         text = (message.text or "").strip()
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Usage: /run <command>")
+            await message.answer(
+                "Usage: /run <command>",
+                reply_markup=context_control_keyboard("help", "status"),
+            )
             return
 
         command = parts[1].strip()
         if not command:
-            await message.answer("Usage: /run <command>")
+            await message.answer(
+                "Usage: /run <command>",
+                reply_markup=context_control_keyboard("help", "status"),
+            )
             return
 
         current_dir = session_manager.get_current_workdir(user.id)
@@ -1450,7 +1530,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
             f"<b>Use:</b> <code>/run &lt;command&gt;</code> for shell.",
             parse_mode="HTML",
-            reply_markup=persistent_control_keyboard(),
+            reply_markup=context_control_keyboard("help", "status"),
         )
 
     return dp
