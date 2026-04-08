@@ -15,6 +15,9 @@ from app.models import Session, SessionState
 ANSI_OSC_RE = re.compile(r"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)")
 ANSI_CSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 ANSI_DCS_RE = re.compile(r"\x1B[P^_].*?\x1B\\", re.DOTALL)
+# 2-char escape sequences like ESC= / ESC> (keypad mode), ESC( / ESC) (charset),
+# and similar terminal mode toggles that should never appear in user-visible output.
+ANSI_ESC_2CHAR_RE = re.compile(r"\x1B[()<=>]")
 ANSI_ESC_RE = re.compile(r"\x1B[@-_]")
 CTRL_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 VALID_SESSION_STATES: set[str] = {"starting", "running", "finished", "failed", "stopped"}
@@ -26,6 +29,7 @@ def sanitize_terminal_text(text: str) -> str:
     cleaned = ANSI_OSC_RE.sub("", text)
     cleaned = ANSI_DCS_RE.sub("", cleaned)
     cleaned = ANSI_CSI_RE.sub("", cleaned)
+    cleaned = ANSI_ESC_2CHAR_RE.sub("", cleaned)
     cleaned = ANSI_ESC_RE.sub("", cleaned)
     cleaned = CTRL_RE.sub("", cleaned)
     return cleaned
