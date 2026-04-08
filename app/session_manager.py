@@ -27,6 +27,7 @@ def sanitize_terminal_text(text: str) -> str:
 
 @dataclass(slots=True)
 class PendingUpload:
+    request_id: str
     telegram_user_id: int
     chat_id: int
     file_id: str

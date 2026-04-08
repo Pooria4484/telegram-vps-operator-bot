@@ -8,12 +8,14 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import secrets
 import shlex
 import subprocess
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
@@ -39,6 +41,26 @@ SESSION_CONTROL_PREFIX = "sessctl"
 SESSION_STREAM_INTERVAL_SECONDS = 2.0
 SESSION_STREAM_MAX_LINES = 20
 
+BTN_STATUS = "Status"
+BTN_TAIL = "Tail"
+BTN_STOP = "Stop"
+BTN_CTRL_C = "Ctrl+C"
+BTN_ENTER = "Enter"
+BTN_CLEAR = "Clear"
+BTN_STREAM = "Stream"
+BTN_HELP = "Help"
+
+QUICK_ACTION_BY_TEXT: dict[str, str] = {
+    BTN_STATUS: "status",
+    BTN_TAIL: "tail",
+    BTN_STOP: "stop",
+    BTN_CTRL_C: "ctrl_c",
+    BTN_ENTER: "enter",
+    BTN_CLEAR: "clear",
+    BTN_STREAM: "stream_toggle",
+    BTN_HELP: "help",
+}
+
 
 def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
     target = raw_target.strip() or "~"
@@ -63,6 +85,15 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def sanitize_uploaded_filename(file_name: str) -> str:
+    # Telegram file names can contain path fragments. Keep only a plain filename
+    # to guarantee uploads stay inside the user's current working directory.
+    safe_name = Path(file_name).name.strip()
+    if not safe_name or safe_name in {".", ".."}:
+        raise ValueError("invalid file name")
+    return safe_name
+
+
 async def save_telegram_file(message: Message, file_id: str, target_path: Path) -> None:
     telegram_file = await message.bot.get_file(file_id)
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -70,58 +101,94 @@ async def save_telegram_file(message: Message, file_id: str, target_path: Path) 
         await message.bot.download_file(telegram_file.file_path, destination=out)
 
 
-def upload_confirm_keyboard() -> InlineKeyboardMarkup:
+def upload_confirm_keyboard(request_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Overwrite", callback_data="upload_overwrite"),
-                InlineKeyboardButton(text="Cancel", callback_data="upload_cancel"),
+                InlineKeyboardButton(text="Overwrite", callback_data=f"upload_overwrite:{request_id}"),
+                InlineKeyboardButton(text="Cancel", callback_data=f"upload_cancel:{request_id}"),
             ]
         ]
     )
+
+
+def parse_upload_callback(data: str | None) -> tuple[str, str] | None:
+    if not data:
+        return None
+    if data in {"upload_cancel", "upload_overwrite"}:
+        return data, ""
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return None
+    action, request_id = parts
+    if action not in {"upload_cancel", "upload_overwrite"}:
+        return None
+    if not request_id:
+        return None
+    return action, request_id
 
 
 def persistent_control_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
-                KeyboardButton(text="/status"),
-                KeyboardButton(text="/tail"),
-                KeyboardButton(text="/stop"),
-                KeyboardButton(text="/clear"),
+                KeyboardButton(text=BTN_STATUS),
+                KeyboardButton(text=BTN_TAIL),
+                KeyboardButton(text=BTN_STOP),
+                KeyboardButton(text=BTN_CTRL_C),
             ],
             [
-                KeyboardButton(text="/ctrl c"),
-                KeyboardButton(text="/ctrl d"),
-                KeyboardButton(text="/n"),
-                KeyboardButton(text="/stream toggle"),
-            ],
-            [
-                KeyboardButton(text="/stream status"),
-                KeyboardButton(text="/stream on"),
-                KeyboardButton(text="/stream off"),
-                KeyboardButton(text="/id"),
+                KeyboardButton(text=BTN_ENTER),
+                KeyboardButton(text=BTN_CLEAR),
+                KeyboardButton(text=BTN_STREAM),
+                KeyboardButton(text=BTN_HELP),
             ],
         ],
         resize_keyboard=True,
-        is_persistent=True,
+        is_persistent=False,
     )
 
 
-def session_control_keyboard(session_id: str) -> InlineKeyboardMarkup:
+def session_control_keyboard_main(session_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="Stop", callback_data=f"{SESSION_CONTROL_PREFIX}:stop:{session_id}"),
                 InlineKeyboardButton(text="Ctrl+C", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_c:{session_id}"),
+                InlineKeyboardButton(text="Status", callback_data=f"{SESSION_CONTROL_PREFIX}:status:{session_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Controls", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_controls:{session_id}"),
+                InlineKeyboardButton(text="Output", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_output:{session_id}"),
+            ],
+        ]
+    )
+
+
+def session_control_keyboard_controls(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
                 InlineKeyboardButton(text="Ctrl+D", callback_data=f"{SESSION_CONTROL_PREFIX}:ctrl_d:{session_id}"),
                 InlineKeyboardButton(text="Enter", callback_data=f"{SESSION_CONTROL_PREFIX}:enter:{session_id}"),
             ],
             [
+                InlineKeyboardButton(text="Back", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_main:{session_id}"),
+            ],
+        ]
+    )
+
+
+def session_control_keyboard_output(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
                 InlineKeyboardButton(text="Tail", callback_data=f"{SESSION_CONTROL_PREFIX}:tail:{session_id}"),
-                InlineKeyboardButton(text="Status", callback_data=f"{SESSION_CONTROL_PREFIX}:status:{session_id}"),
                 InlineKeyboardButton(text="Stream", callback_data=f"{SESSION_CONTROL_PREFIX}:stream_toggle:{session_id}"),
-                InlineKeyboardButton(text="Clear Output", callback_data=f"{SESSION_CONTROL_PREFIX}:clear:{session_id}"),
+                InlineKeyboardButton(text="Clear", callback_data=f"{SESSION_CONTROL_PREFIX}:clear:{session_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Back", callback_data=f"{SESSION_CONTROL_PREFIX}:menu_main:{session_id}"),
             ],
         ]
     )
@@ -139,13 +206,42 @@ def parse_session_control_callback(data: str | None) -> tuple[str, str] | None:
     if prefix != SESSION_CONTROL_PREFIX:
         return None
 
-    if action not in {"stop", "ctrl_c", "ctrl_d", "enter", "tail", "status", "stream_toggle", "clear"}:
+    if action not in {
+        "stop",
+        "ctrl_c",
+        "ctrl_d",
+        "enter",
+        "tail",
+        "status",
+        "stream_toggle",
+        "clear",
+        "menu_main",
+        "menu_controls",
+        "menu_output",
+    }:
         return None
 
     if not session_id:
         return None
 
     return action, session_id
+
+
+def bot_command_menu() -> list[BotCommand]:
+    return [
+        BotCommand(command="help", description="Show help"),
+        BotCommand(command="id", description="Show your Telegram user id"),
+        BotCommand(command="run", description="Run command or cd"),
+        BotCommand(command="status", description="Show active session status"),
+        BotCommand(command="tail", description="Show recent output"),
+        BotCommand(command="stop", description="Stop active session"),
+        BotCommand(command="ctrl", description="Send Ctrl+C or Ctrl+D"),
+        BotCommand(command="n", description="Send Enter/newline"),
+        BotCommand(command="clear", description="Clear output buffer"),
+        BotCommand(command="stream", description="Stream on/off/toggle/status"),
+        BotCommand(command="live", description="Alias for /stream"),
+        BotCommand(command="get", description="Download file from VPS"),
+    ]
 
 
 def should_run_without_pty(command: str) -> bool:
@@ -536,6 +632,149 @@ async def wait_session_exit(
 def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dispatcher:
     dp = Dispatcher()
 
+    async def do_help(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        await message.answer(
+            format_help_message(current_dir),
+            parse_mode="HTML",
+            reply_markup=persistent_control_keyboard(),
+        )
+
+    async def do_status(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        stream_enabled = session_manager.is_stream_enabled(user_id)
+        await message.answer(
+            format_session_status_message(session, current_dir, stream_enabled),
+            parse_mode="HTML",
+        )
+
+    async def do_tail(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            session = session_manager.get_latest_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+        await message.answer(format_tail_message(session, tail_lines), parse_mode="HTML")
+
+    async def do_stop(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        process = session.process
+        if process is None:
+            await message.answer("No live process is attached to the active session.")
+            return
+
+        if session.stop_requested:
+            await message.answer("Stop is already requested for this session.")
+            return
+
+        session.stop_requested = True
+        await message.answer(f"Stop requested for session {session.session_id}.")
+        await stop_live_command(process)
+
+    async def do_ctrl_c(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        process = session.process
+        if process is None:
+            await message.answer("No live process is attached to the active session.")
+            return
+
+        if not send_ctrl_c(process):
+            await message.answer("Could not send Ctrl+C. Process is no longer running.")
+            return
+
+        await message.answer(f"Sent Ctrl+C to session {session.session_id}.")
+
+    async def do_ctrl_d(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        master_fd = session.pty_master_fd
+        if master_fd is None:
+            await message.answer("No active PTY is attached to the session.")
+            return
+
+        if not send_pty_input(master_fd, b"\x04"):
+            await message.answer("Could not send Ctrl+D. PTY is no longer available.")
+            return
+
+        await message.answer(f"Sent Ctrl+D (EOF) to session {session.session_id}.")
+
+    async def do_enter(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        master_fd = session.pty_master_fd
+        if master_fd is None:
+            await message.answer("No active PTY is attached to the session.")
+            return
+
+        if not send_pty_input(master_fd, b"\n"):
+            await message.answer("Could not send Enter. PTY is no longer available.")
+            return
+
+        await message.answer(f"Sent Enter to session {session.session_id}.")
+
+    async def do_clear(message: Message, user_id: int) -> None:
+        current_dir = session_manager.get_current_workdir(user_id)
+        session = session_manager.get_active_session_for_user(user_id)
+        if not session:
+            await answer_no_active_session(message, current_dir)
+            return
+
+        session_manager.clear_output_buffer(session)
+        await message.answer(
+            f"Output buffer cleared for session <code>{escape(session.session_id)}</code>.",
+            parse_mode="HTML",
+        )
+
+    async def do_stream_mode(message: Message, user_id: int, mode: str) -> None:
+        if mode not in {"on", "off", "toggle", "status"}:
+            await message.answer("Usage: /stream <on|off|toggle|status> (alias: /live)")
+            return
+
+        if mode == "status":
+            enabled = session_manager.is_stream_enabled(user_id)
+            state_text = "on" if enabled else "off"
+            await message.answer(f"Stream mode: <code>{state_text}</code>", parse_mode="HTML")
+            return
+
+        if mode == "toggle":
+            enabled = not session_manager.is_stream_enabled(user_id)
+        else:
+            enabled = mode == "on"
+        session_manager.set_stream_enabled(user_id, enabled)
+        if enabled:
+            session = session_manager.get_active_session_for_user(user_id)
+            if session:
+                session.stream_last_sent_text = ""
+        state_text = "enabled" if enabled else "disabled"
+        await message.answer(f"Stream mode {state_text}.", parse_mode="HTML")
+
     @dp.message(CommandStart())
     async def start_handler(message: Message) -> None:
         user = message.from_user
@@ -578,12 +817,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        await message.answer(
-            format_help_message(current_dir),
-            parse_mode="HTML",
-            reply_markup=persistent_control_keyboard(),
-        )
+        await do_help(message, user.id)
 
     @dp.message(Command("status"))
     async def status_handler(message: Message) -> None:
@@ -591,17 +825,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
-        stream_enabled = session_manager.is_stream_enabled(user.id)
-        await message.answer(
-            format_session_status_message(session, current_dir, stream_enabled),
-            parse_mode="HTML",
-        )
+        await do_status(message, user.id)
 
     @dp.message(Command("tail"))
     async def tail_handler(message: Message) -> None:
@@ -609,16 +833,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
-        if not session:
-            session = session_manager.get_latest_session_for_user(user.id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
-        tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
-        await message.answer(format_tail_message(session, tail_lines), parse_mode="HTML")
+        await do_tail(message, user.id)
 
     @dp.message(Command("get"))
     async def get_handler(message: Message) -> None:
@@ -690,25 +905,33 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await message.answer("Upload failed: missing file name.")
             return
 
+        try:
+            safe_name = sanitize_uploaded_filename(document.file_name)
+        except ValueError:
+            await message.answer("Upload failed: invalid file name.")
+            return
+
         current_dir = session_manager.get_current_workdir(user.id)
-        target_path = (current_dir / document.file_name).resolve()
+        target_path = (current_dir / safe_name).resolve()
 
         if target_path.exists():
+            pending = PendingUpload(
+                request_id=secrets.token_hex(4),
+                telegram_user_id=user.id,
+                chat_id=message.chat.id,
+                file_id=document.file_id,
+                file_name=safe_name,
+                target_path=target_path,
+            )
             session_manager.set_pending_upload(
-                PendingUpload(
-                    telegram_user_id=user.id,
-                    chat_id=message.chat.id,
-                    file_id=document.file_id,
-                    file_name=document.file_name,
-                    target_path=target_path,
-                )
+                pending
             )
             await message.answer(
                 f"<b>File already exists</b>\n"
                 f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
                 f"<b>Action:</b> <code>overwrite?</code>",
                 parse_mode="HTML",
-                reply_markup=upload_confirm_keyboard(),
+                reply_markup=upload_confirm_keyboard(pending.request_id),
             )
             return
 
@@ -727,13 +950,29 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 parse_mode="HTML",
             )
 
-    @dp.callback_query(F.data == "upload_cancel")
+    @dp.callback_query(F.data.startswith("upload_cancel"))
     async def upload_cancel_handler(callback: CallbackQuery) -> None:
         user = callback.from_user
         if not user or not is_allowed(user.id, settings):
             return
 
+        parsed = parse_upload_callback(callback.data)
+        if not parsed:
+            await callback.answer("Invalid action.", show_alert=False)
+            return
+        _, request_id = parsed
+
         pending = session_manager.get_pending_upload(user.id)
+        if not pending:
+            await callback.answer("No pending upload.", show_alert=False)
+            return
+        if not request_id:
+            await callback.answer("Stale upload prompt.", show_alert=False)
+            return
+        if pending.request_id != request_id:
+            await callback.answer("Stale upload prompt.", show_alert=False)
+            return
+
         session_manager.clear_pending_upload(user.id)
 
         if callback.message:
@@ -742,19 +981,31 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 text += f"\n<b>Path:</b> <code>{escape(str(pending.target_path))}</code>"
             await callback.message.edit_text(text, parse_mode="HTML")
 
-        await callback.answer("Cancelled")
+        await callback.answer("Upload cancelled.", show_alert=False)
 
-    @dp.callback_query(F.data == "upload_overwrite")
+    @dp.callback_query(F.data.startswith("upload_overwrite"))
     async def upload_overwrite_handler(callback: CallbackQuery) -> None:
         user = callback.from_user
         if not user or not is_allowed(user.id, settings):
             return
 
+        parsed = parse_upload_callback(callback.data)
+        if not parsed:
+            await callback.answer("Invalid action.", show_alert=False)
+            return
+        _, request_id = parsed
+
         pending = session_manager.get_pending_upload(user.id)
         if not pending:
-            await callback.answer("No pending upload", show_alert=False)
+            await callback.answer("No pending upload.", show_alert=False)
             if callback.message:
                 await callback.message.edit_text("<b>No pending upload</b>", parse_mode="HTML")
+            return
+        if not request_id:
+            await callback.answer("Stale upload prompt.", show_alert=False)
+            return
+        if pending.request_id != request_id:
+            await callback.answer("Stale upload prompt.", show_alert=False)
             return
 
         if callback.message:
@@ -778,7 +1029,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                     f"<b>SHA256:</b> <code>{file_sha256}</code>",
                     parse_mode="HTML",
                 )
-            await callback.answer("Overwritten")
+            await callback.answer("Upload overwritten.", show_alert=False)
         except Exception as exc:
             if callback.message:
                 await callback.message.edit_text(
@@ -786,7 +1037,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                     f"<b>Error:</b> <code>{escape(str(exc))}</code>",
                     parse_mode="HTML",
                 )
-            await callback.answer("Failed", show_alert=False)
+            await callback.answer("Upload failed.", show_alert=False)
         finally:
             session_manager.clear_pending_upload(user.id)
 
@@ -798,7 +1049,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         parsed = parse_session_control_callback(callback.data)
         if not parsed:
-            await callback.answer("Invalid control.", show_alert=False)
+            await callback.answer("Invalid action.", show_alert=False)
             return
 
         action, target_session_id = parsed
@@ -809,7 +1060,34 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return
 
         if session.session_id != target_session_id:
-            await callback.answer("Stale control message.", show_alert=False)
+            await callback.answer("Stale control.", show_alert=False)
+            return
+
+        if action == "menu_main":
+            if callback.message:
+                with contextlib.suppress(Exception):
+                    await callback.message.edit_reply_markup(
+                        reply_markup=session_control_keyboard_main(session.session_id)
+                    )
+            await callback.answer("Main menu.", show_alert=False)
+            return
+
+        if action == "menu_controls":
+            if callback.message:
+                with contextlib.suppress(Exception):
+                    await callback.message.edit_reply_markup(
+                        reply_markup=session_control_keyboard_controls(session.session_id)
+                    )
+            await callback.answer("Controls menu.", show_alert=False)
+            return
+
+        if action == "menu_output":
+            if callback.message:
+                with contextlib.suppress(Exception):
+                    await callback.message.edit_reply_markup(
+                        reply_markup=session_control_keyboard_output(session.session_id)
+                    )
+            await callback.answer("Output menu.", show_alert=False)
             return
 
         if action == "status":
@@ -841,12 +1119,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             if enabled:
                 session.stream_last_sent_text = ""
             mode_text = "on" if enabled else "off"
-            await callback.answer(f"Stream mode: {mode_text}", show_alert=False)
+            await callback.answer(f"Stream: {mode_text}.", show_alert=False)
             return
 
         if action == "clear":
             session_manager.clear_output_buffer(session)
-            await callback.answer("Output buffer cleared.", show_alert=False)
+            await callback.answer("Output cleared.", show_alert=False)
             return
 
         if action == "stop":
@@ -871,10 +1149,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 return
 
             if not send_ctrl_c(process):
-                await callback.answer("Process is no longer running.", show_alert=False)
+                await callback.answer("Process is not running.", show_alert=False)
                 return
 
-            await callback.answer("Sent Ctrl+C.", show_alert=False)
+            await callback.answer("Ctrl+C sent.", show_alert=False)
             return
 
         master_fd = session.pty_master_fd
@@ -885,10 +1163,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         payload = b"\x04" if action == "ctrl_d" else b"\n"
         action_name = "Ctrl+D" if action == "ctrl_d" else "Enter"
         if not send_pty_input(master_fd, payload):
-            await callback.answer("PTY is no longer available.", show_alert=False)
+            await callback.answer("PTY is unavailable.", show_alert=False)
             return
 
-        await callback.answer(f"Sent {action_name}.", show_alert=False)
+        await callback.answer(f"{action_name} sent.", show_alert=False)
 
     @dp.message(Command("stop"))
     async def stop_handler(message: Message) -> None:
@@ -896,24 +1174,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
-        process = session.process
-        if process is None:
-            await message.answer("No live process is attached to the active session.")
-            return
-
-        if session.stop_requested:
-            await message.answer("Stop is already requested for this session.")
-            return
-
-        session.stop_requested = True
-        await message.answer(f"Stop requested for session {session.session_id}.")
-        await stop_live_command(process)
+        await do_stop(message, user.id)
 
     @dp.message(Command("ctrl"))
     async def ctrl_handler(message: Message) -> None:
@@ -932,35 +1193,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             await message.answer("Usage: /ctrl <c|d>")
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
         if action == "c":
-            process = session.process
-            if process is None:
-                await message.answer("No live process is attached to the active session.")
-                return
-
-            if not send_ctrl_c(process):
-                await message.answer("Could not send Ctrl+C. Process is no longer running.")
-                return
-
-            await message.answer(f"Sent Ctrl+C to session {session.session_id}.")
+            await do_ctrl_c(message, user.id)
             return
 
-        master_fd = session.pty_master_fd
-        if master_fd is None:
-            await message.answer("No active PTY is attached to the session.")
-            return
-
-        if not send_pty_input(master_fd, b"\x04"):
-            await message.answer("Could not send Ctrl+D. PTY is no longer available.")
-            return
-
-        await message.answer(f"Sent Ctrl+D (EOF) to session {session.session_id}.")
+        await do_ctrl_d(message, user.id)
 
     @dp.message(Command("n"))
     async def newline_handler(message: Message) -> None:
@@ -968,22 +1205,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
-        master_fd = session.pty_master_fd
-        if master_fd is None:
-            await message.answer("No active PTY is attached to the session.")
-            return
-
-        if not send_pty_input(master_fd, b"\n"):
-            await message.answer("Could not send Enter. PTY is no longer available.")
-            return
-
-        await message.answer(f"Sent Enter to session {session.session_id}.")
+        await do_enter(message, user.id)
 
     @dp.message(Command("clear"))
     async def clear_output_handler(message: Message) -> None:
@@ -991,17 +1213,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not user or not is_allowed(user.id, settings):
             return
 
-        current_dir = session_manager.get_current_workdir(user.id)
-        session = session_manager.get_active_session_for_user(user.id)
-        if not session:
-            await answer_no_active_session(message, current_dir)
-            return
-
-        session_manager.clear_output_buffer(session)
-        await message.answer(
-            f"Output buffer cleared for session <code>{escape(session.session_id)}</code>.",
-            parse_mode="HTML",
-        )
+        await do_clear(message, user.id)
 
     @dp.message(Command(commands=["stream", "live"]))
     async def stream_mode_handler(message: Message) -> None:
@@ -1012,27 +1224,40 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         text = (message.text or "").strip()
         parts = text.split(maxsplit=1)
         mode = parts[1].strip().lower() if len(parts) >= 2 else "status"
-        if mode not in {"on", "off", "toggle", "status"}:
-            await message.answer("Usage: /stream <on|off|toggle|status> (alias: /live)")
+        await do_stream_mode(message, user.id, mode)
+
+    @dp.message(F.text.in_(list(QUICK_ACTION_BY_TEXT.keys())))
+    async def quick_action_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
             return
 
-        if mode == "status":
-            enabled = session_manager.is_stream_enabled(user.id)
-            state_text = "on" if enabled else "off"
-            await message.answer(f"Stream mode: <code>{state_text}</code>", parse_mode="HTML")
+        text = (message.text or "").strip()
+        action = QUICK_ACTION_BY_TEXT.get(text)
+        if action == "help":
+            await do_help(message, user.id)
             return
-
-        if mode == "toggle":
-            enabled = not session_manager.is_stream_enabled(user.id)
-        else:
-            enabled = mode == "on"
-        session_manager.set_stream_enabled(user.id, enabled)
-        if enabled:
-            session = session_manager.get_active_session_for_user(user.id)
-            if session:
-                session.stream_last_sent_text = ""
-        state_text = "enabled" if enabled else "disabled"
-        await message.answer(f"Stream mode {state_text}.", parse_mode="HTML")
+        if action == "status":
+            await do_status(message, user.id)
+            return
+        if action == "tail":
+            await do_tail(message, user.id)
+            return
+        if action == "stop":
+            await do_stop(message, user.id)
+            return
+        if action == "ctrl_c":
+            await do_ctrl_c(message, user.id)
+            return
+        if action == "enter":
+            await do_enter(message, user.id)
+            return
+        if action == "clear":
+            await do_clear(message, user.id)
+            return
+        if action == "stream_toggle":
+            await do_stream_mode(message, user.id, "toggle")
+            return
 
     @dp.message(Command("run"))
     async def run_handler(message: Message) -> None:
@@ -1186,10 +1411,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 stream_enabled=session_manager.is_stream_enabled(user.id),
             ),
             parse_mode="HTML",
-            reply_markup=session_control_keyboard(session.session_id),
+            reply_markup=session_control_keyboard_main(session.session_id),
         )
         await message.answer(
-            "Persistent controls are available on your keyboard.",
+            "Quick action controls are available on your keyboard.",
             reply_markup=persistent_control_keyboard(),
         )
 
