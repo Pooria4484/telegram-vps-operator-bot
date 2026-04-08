@@ -602,6 +602,15 @@ class SessionManager:
             current_line += char
         session.tail_partial = current_line
 
+        if complete_lines and session.pending_echo_inputs:
+            filtered_lines: list[str] = []
+            for line in complete_lines:
+                if session.pending_echo_inputs and line.strip() == session.pending_echo_inputs[0]:
+                    session.pending_echo_inputs.pop(0)
+                    continue
+                filtered_lines.append(line)
+            complete_lines = filtered_lines
+
         if complete_lines:
             self.append_tail(session, complete_lines, max_tail_lines)
 

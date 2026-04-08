@@ -309,23 +309,25 @@ def sessions_list_keyboard(
                 ),
             ]
         )
-    nav_row: list[InlineKeyboardButton] = []
-    if page > 1:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="Prev",
-                callback_data=f"{SESSION_PAGE_PREFIX}:{page - 1}",
-            )
+    if total_pages > 1:
+        prev_enabled = page > 1
+        next_enabled = page < total_pages
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="◀ Prev" if prev_enabled else "⛔ Prev",
+                    callback_data=(
+                        f"{SESSION_PAGE_PREFIX}:{page - 1}" if prev_enabled else f"{SESSION_PAGE_PREFIX}:noop"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="Next ▶" if next_enabled else "Next ⛔",
+                    callback_data=(
+                        f"{SESSION_PAGE_PREFIX}:{page + 1}" if next_enabled else f"{SESSION_PAGE_PREFIX}:noop"
+                    ),
+                ),
+            ]
         )
-    if page < total_pages:
-        nav_row.append(
-            InlineKeyboardButton(
-                text="Next",
-                callback_data=f"{SESSION_PAGE_PREFIX}:{page + 1}",
-            )
-        )
-    if nav_row:
-        rows.append(nav_row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -354,6 +356,8 @@ def parse_sessions_page_callback(data: str | None) -> int | None:
     prefix, page_raw = parts
     if prefix != SESSION_PAGE_PREFIX:
         return None
+    if page_raw == "noop":
+        return 0
     try:
         page = int(page_raw)
     except ValueError:
@@ -1277,6 +1281,45 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             ),
         )
 
+    async def do_sessions_edit(message: Message, user_id: int, page: int = 1) -> None:
+        sessions = session_manager.list_sessions_for_user(user_id, limit=None)
+        running_count = session_manager.count_running_sessions_for_user(user_id)
+        if not sessions:
+            with contextlib.suppress(Exception):
+                await message.edit_text("<b>No sessions found</b>", parse_mode="HTML")
+            return
+        page_size = settings.sessions_page_size
+        total_pages = max(1, (len(sessions) + page_size - 1) // page_size)
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * page_size
+        page_sessions = sessions[start : start + page_size]
+        session_ids = [s.session_id for s in page_sessions if s.state in {"starting", "running"}]
+        body = format_sessions_list_message(
+            sessions=page_sessions,
+            max_running=settings.max_running_sessions_per_user,
+            running_count=running_count,
+            now=session_manager.now(),
+        )
+        text = f"{body}\n<b>Page:</b> <code>{page}/{total_pages}</code>"
+        markup = (
+            sessions_list_keyboard(session_ids, page=page, total_pages=total_pages)
+            if session_ids or total_pages > 1
+            else None
+        )
+        try:
+            await message.edit_text(
+                text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                await message.answer(
+                    text,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+
     async def do_detach(message: Message, user_id: int) -> None:
         session = session_manager.detach_active_session_for_user(user_id)
         if not session:
@@ -2154,10 +2197,13 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if page is None:
             await callback.answer("Invalid page.", show_alert=False)
             return
+        if page == 0:
+            await callback.answer("No more pages.", show_alert=False)
+            return
         if not callback.message:
             await callback.answer("No message context.", show_alert=False)
             return
-        await do_sessions(callback.message, user.id, page=page)
+        await do_sessions_edit(callback.message, user.id, page=page)
         await callback.answer(f"Page {page}.", show_alert=False)
 
     @dp.callback_query(F.data.startswith(f"{KILL_CONFIRM_PREFIX}:"))
@@ -2509,6 +2555,11 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
             if session_manager.is_stream_enabled(user.id):
                 reset_stream_state_for_new_input(session, session_manager)
+            stripped = text.strip()
+            if stripped:
+                session.pending_echo_inputs.append(stripped)
+                if len(session.pending_echo_inputs) > 20:
+                    session.pending_echo_inputs = session.pending_echo_inputs[-20:]
             data = text.encode(errors="replace") + b"\n"
             if not send_pty_input(master_fd, data):
                 await message.answer("Could not send text to active session.")

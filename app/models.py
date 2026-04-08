@@ -37,3 +37,4 @@ class Session:
     stream_frame_index: int = 0
     stream_frame_body: str = ""
     stream_current_line_start: int = 0
+    pending_echo_inputs: list[str] = field(default_factory=list)
