@@ -48,6 +48,7 @@ SESSION_PAGE_PREFIX = "sesspage"
 KILL_CONFIRM_PREFIX = "killcfm"
 SESSION_STREAM_INTERVAL_SECONDS = 1.0
 STREAM_FRAME_MAX_BODY_CHARS = 2400
+RESULT_CHUNK_MAX_CHARS = 3600
 logger = logging.getLogger(__name__)
 
 BTN_STATUS = "Status"
@@ -474,6 +475,16 @@ def is_shell_session_command(command: str) -> bool:
     return executable in {"bash", "zsh", "sh", "dash", "ash", "ksh", "fish"}
 
 
+def is_codex_session_command(command: str) -> bool:
+    try:
+        parts = shlex.split(command)
+    except Exception:
+        return False
+    if not parts:
+        return False
+    return Path(parts[0]).name.lower() == "codex"
+
+
 def is_detached_session_idle_for_ttl(session: Session) -> bool:
     process = session.process
     if process is None or process.returncode is not None:
@@ -631,6 +642,16 @@ def format_live_start_message(
     stream_enabled: bool,
 ) -> str:
     stream_mode = "on" if stream_enabled else "off"
+    codex_hint = ""
+    try:
+        parts = shlex.split(command)
+        if parts and Path(parts[0]).name.lower() == "codex":
+            codex_hint = (
+                "\n<b>Codex hint:</b> use <code>!/...</code> for codex slash commands "
+                "(example: <code>!/init</code>)"
+            )
+    except Exception:
+        pass
     return (
         f"<b>Live Session Started</b>\n"
         f"{format_session_header(session_id, state)}\n"
@@ -641,6 +662,7 @@ def format_live_start_message(
         f"<b>Stream mode:</b> <code>{stream_mode}</code> "
         f"(toggle with <code>/stream toggle</code>)\n"
         f"<b>Interactive:</b> send plain text to active session (example: <code>ls</code>)\n"
+        f"{codex_hint}"
         f"<b>Tip:</b> use <code>/tail</code>, <code>/status</code>, <code>/stop</code>, "
         f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/stream status</code>"
     )
@@ -665,6 +687,52 @@ def format_session_result(
         f"<b>Output</b>\n"
         f"{rendered_lines}"
     )
+
+
+def _render_output_line(line: str) -> str:
+    if not line:
+        return "<code> </code>"
+    parts = [part for part in re.split(r"\s+", line.strip()) if part]
+    if not parts:
+        return "<code> </code>"
+    normalized_parts = normalize_output_parts(parts)
+    return " ".join(f"<code>{escape(part)}</code>" for part in normalized_parts)
+
+
+def build_session_result_chunks(
+    session_id: str,
+    state: str,
+    exit_code: int | None,
+    cwd: str,
+    output: str,
+    max_chars: int = RESULT_CHUNK_MAX_CHARS,
+) -> list[str]:
+    safe_exit = escape(str(exit_code))
+    safe_cwd = escape(cwd)
+    header = (
+        f"{format_session_header(session_id, state)}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"<b>Exit code:</b> <code>{safe_exit}</code>\n"
+        f"<b>Current dir:</b> <code>{safe_cwd}</code>\n"
+        f"<b>Output</b>\n"
+    )
+    lines = (output or "[no output]").splitlines() or ["[no output]"]
+    rendered_lines = [_render_output_line(line) for line in lines]
+
+    chunks: list[str] = []
+    current = header
+    for rendered in rendered_lines:
+        piece = f"{rendered}\n"
+        if len(current) + len(piece) <= max_chars:
+            current += piece
+            continue
+        if current.strip():
+            chunks.append(current.rstrip())
+        # Continuation messages contain only output body for readability.
+        current = piece
+    if current.strip():
+        chunks.append(current.rstrip())
+    return chunks
 
 
 def format_local_timestamp(value: datetime | None) -> str:
@@ -753,7 +821,9 @@ def format_help_message(current_dir: Path) -> str:
         "• ارسال فایل: آپلود فایل در مسیر کاری فعلی شما\n"
         "  مثال: فایل را مستقیم در چت ارسال کنید\n"
         "• متن ساده در حالت سشن فعال: به stdin همان سشن ارسال می‌شود\n"
-        "  مثال: بعد از <code>/run bash</code> پیام <code>pwd</code> بفرستید\n\n"
+        "  مثال: بعد از <code>/run bash</code> پیام <code>pwd</code> بفرستید\n"
+        "• نکته Codex: برای اسلش‌های codex از <code>!/...</code> استفاده کنید\n"
+        "  مثال: <code>!/init</code> یا <code>!/status</code>\n\n"
         "<b>English (with examples)</b>\n"
         "• <code>/help</code>: show this help\n"
         "  Example: <code>/help</code>\n"
@@ -798,7 +868,9 @@ def format_help_message(current_dir: Path) -> str:
         "• File upload: send a file directly in chat\n"
         "  Example: upload <code>deploy.sh</code> to current dir\n"
         "• Plain text while a session is active: forwarded to session stdin\n"
-        "  Example: run <code>/run zsh</code>, then send <code>ls</code>\n\n"
+        "  Example: run <code>/run zsh</code>, then send <code>ls</code>\n"
+        "• Codex note: use <code>!/...</code> for codex slash commands\n"
+        "  Example: <code>!/init</code> or <code>!/status</code>\n\n"
         f"<b>Current dir:</b> <code>{safe_dir}</code>"
     )
 
@@ -1181,16 +1253,16 @@ async def wait_session_exit(
     current_dir = session_manager.get_current_workdir(session.telegram_user_id)
     tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
     tail_text = "\n".join(tail_lines) if tail_lines else "[no output]"
-    final_text = format_session_result(
+    chunks = build_session_result_chunks(
         session_id=session.session_id,
         state=session.state,
         exit_code=session.exit_code,
         cwd=str(current_dir),
         output=tail_text,
     )
-
     with contextlib.suppress(Exception):
-        await bot.send_message(session.chat_id, final_text, parse_mode="HTML")
+        for chunk in chunks:
+            await bot.send_message(session.chat_id, chunk, parse_mode="HTML")
 
 
 def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dispatcher:
@@ -1539,7 +1611,8 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         if session_manager.is_stream_enabled(user_id):
             reset_stream_state_for_new_input(session, session_manager)
-        if not send_pty_input(master_fd, b"\n"):
+        enter_payload = b"\r" if is_codex_session_command(session.command) else b"\n"
+        if not send_pty_input(master_fd, enter_payload):
             await message.answer("Could not send Enter. PTY is no longer available.")
             return
 
@@ -1655,6 +1728,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "/get <path>\n"
             "/status [session_id]\n"
             "/tail [session_id]\n\n"
+            "Codex in active session: use !/... for codex slash commands (example: !/init)\n\n"
             "Upload behavior:\n"
             "- send a file directly\n"
             "- it will be saved in your current dir\n\n"
@@ -2454,17 +2528,19 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
             combined_output = f"{stdout_text}{stderr_text}".strip() or "[no output]"
             state = "finished" if exit_code == 0 else "failed"
-            await message.answer(
-                format_session_result(
-                    session_id="oneshot",
-                    state=state,
-                    exit_code=exit_code,
-                    cwd=str(current_dir),
-                    output=combined_output,
-                ),
-                parse_mode="HTML",
-                reply_markup=persistent_control_keyboard(),
+            chunks = build_session_result_chunks(
+                session_id="oneshot",
+                state=state,
+                exit_code=exit_code,
+                cwd=str(current_dir),
+                output=combined_output,
             )
+            for i, chunk in enumerate(chunks):
+                await message.answer(
+                    chunk,
+                    parse_mode="HTML",
+                    reply_markup=persistent_control_keyboard() if i == 0 else None,
+                )
             return
 
         session = session_manager.create_session(
@@ -2505,14 +2581,15 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
             tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
             tail_text = "\n".join(tail_lines) if tail_lines else "[no output]"
-            final_text = format_session_result(
+            chunks = build_session_result_chunks(
                 session_id=session.session_id,
                 state=session.state,
                 exit_code=session.exit_code,
                 cwd=str(current_dir),
                 output=tail_text,
             )
-            await message.answer(final_text, parse_mode="HTML")
+            for chunk in chunks:
+                await message.answer(chunk, parse_mode="HTML")
             return
 
         session.state = "running"
@@ -2568,15 +2645,19 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             text = message.text or ""
             if not text:
                 return
+            outbound = text
+            if is_codex_session_command(session.command) and outbound.startswith("!/"):
+                outbound = "/" + outbound[2:]
 
             if session_manager.is_stream_enabled(user.id):
                 reset_stream_state_for_new_input(session, session_manager)
-            stripped = text.strip()
+            stripped = outbound.strip()
             if stripped:
                 session.pending_echo_inputs.append(stripped)
                 if len(session.pending_echo_inputs) > 20:
                     session.pending_echo_inputs = session.pending_echo_inputs[-20:]
-            data = text.encode(errors="replace") + b"\n"
+            line_ending = b"\r" if is_codex_session_command(session.command) else b"\n"
+            data = outbound.encode(errors="replace") + line_ending
             if not send_pty_input(master_fd, data):
                 await message.answer("Could not send text to active session.")
             return
@@ -2593,6 +2674,26 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
             f"<b>Use:</b> <code>/run &lt;command&gt;</code> for shell."
             f"{hint}",
+            parse_mode="HTML",
+            reply_markup=context_control_keyboard("help", "status"),
+        )
+
+    @dp.message(F.text.startswith("/"))
+    async def unknown_slash_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        session = session_manager.get_active_session_for_user(user.id)
+        if session and is_codex_session_command(session.command):
+            await message.answer(
+                "<b>Codex slash hint</b>\n"
+                "For codex internal slash commands, use <code>!/...</code>\n"
+                "Example: <code>!/init</code>, <code>!/status</code>",
+                parse_mode="HTML",
+            )
+            return
+        await message.answer(
+            "Unknown command.\nUse <code>/help</code>.",
             parse_mode="HTML",
             reply_markup=context_control_keyboard("help", "status"),
         )

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import lru_cache
+import fcntl
 import os
 from pathlib import Path
 import pwd
 import pty
 import re
 import signal
+import struct
 import subprocess
+import termios
 
 
 @dataclass(slots=True)
@@ -152,6 +156,18 @@ async def run_command(
 async def start_live_command(command: str, shell: str, cwd: Path) -> LiveCommand:
     master_fd, slave_fd = pty.openpty()
     env = build_command_env()
+    # Some interactive TUIs (including codex) rely on a valid terminal size.
+    # openpty() can expose an unusable default in some environments, causing
+    # per-character wrapping and unstable behavior.
+    rows = int(env.get("LINES", "40") or 40)
+    cols = int(env.get("COLUMNS", "120") or 120)
+    rows = max(10, min(rows, 200))
+    cols = max(40, min(cols, 300))
+    env["LINES"] = str(rows)
+    env["COLUMNS"] = str(cols)
+    with suppress(Exception):
+        winsz = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsz)
     try:
         process = await asyncio.create_subprocess_exec(
             shell,
