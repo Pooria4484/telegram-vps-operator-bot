@@ -7,6 +7,7 @@ This project focuses on practical VPS workflows:
 - keep per-user working directory
 - manage a live PTY session
 - stream/tail output
+- start shell sessions quickly from Telegram UI
 - upload and download files
 - show SHA256 for upload/download integrity
 
@@ -19,12 +20,14 @@ This project focuses on practical VPS workflows:
 - Session controls: stop, Ctrl+C, Ctrl+D, Enter
 - Output tail buffer with ANSI/control-sequence sanitization
 - Optional live stream output mode (`/stream` or `/live`)
+- Quick shell launch actions for `bash` and `zsh`
+- Smart monospace output rendering with copy-friendly units for history, paths, URLs, key/value lines, and stream frames
 - File upload to current working directory with overwrite confirmation
 - Upload filename sanitization and size limit enforcement
 - File download with `/get <path>`
 - SHA256 hash in upload/download responses
 - Command suggestions on `/` via Telegram bot command menu
-- Quick action keyboard (non-persistent)
+- Persistent quick action keyboard
 - Context inline controls (`Help`, `Status`, `Tail`) on usage/error messages
 - Baseline operational logging (startup/session/upload/get)
 
@@ -53,6 +56,14 @@ Buffer behavior:
 - In stream `off`, `/tail` shows and consumes (clears) the shown buffer.
 - Stream mode is persisted per user in SQLite until the user changes it.
 - Live stream output uses rolling frames; control buttons stay on the latest live frame only.
+- Long output is chunked by both message length and Telegram formatting budget.
+- Live frames roll over before formatting degrades, so large outputs keep their copy-friendly monospace rendering.
+
+Output rendering behavior:
+- History-like lines render as `index` + full command, so the command can be copied in one tap.
+- Paths, URLs, proxy links, hashes, UUIDs, and similar standalone values render as one copy unit.
+- `key=value` and `key: value` lines render as key + value units instead of word-by-word.
+- Table-like and log-like lines keep readable structured monospace output.
 
 ## Quick Action Keyboard
 
@@ -67,6 +78,12 @@ Current quick actions shown in chat keyboard:
 - `Enter`
 - `Stream`
 - `Help`
+- `Open Shell`
+
+Quick shell actions:
+- `Open Shell` opens an inline picker for `zsh` and `bash`.
+- `/start` also shows shell start actions when you want to open a session quickly.
+- `/sessions` includes `New zsh` and `New bash` actions for creating another session from the sessions view.
 
 ## Interactive Shell Examples
 
@@ -79,6 +96,15 @@ Current quick actions shown in chat keyboard:
   - `/run zsh`
   - then send plain text: `whoami`
   - exit with `/ctrl d` or `/stop`
+
+- Start shell from Telegram UI:
+  - tap `Open Shell`
+  - choose `zsh` or `bash`
+  - then send plain text commands such as `pwd`
+
+- Codex session note:
+  - bot slash commands still use `/...`
+  - inside a `codex` session, use `!/init`, `!/status`, and similar to send codex slash commands
 
 ## Installation
 
