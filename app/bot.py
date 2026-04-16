@@ -49,7 +49,10 @@ KILL_CONFIRM_PREFIX = "killcfm"
 SHELL_PICKER_PREFIX = "shellpick"
 SESSION_STREAM_INTERVAL_SECONDS = 1.0
 STREAM_FRAME_MAX_BODY_CHARS = 2400
+STREAM_FRAME_MAX_BODY_ENTITIES = 80
 RESULT_CHUNK_MAX_CHARS = 3600
+RESULT_CHUNK_MAX_ENTITIES = 350
+RENDER_LINE_SPLIT_MAX_CHARS = 3200
 logger = logging.getLogger(__name__)
 
 BTN_STATUS = "Status"
@@ -84,6 +87,13 @@ class PendingKill:
     request_id: str
     telegram_user_id: int
     session_id: str
+
+
+@dataclass(slots=True)
+class RenderedOutputLine:
+    html: str
+    entity_count: int
+    mode: str = "token"
 
 
 def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
@@ -542,6 +552,32 @@ def format_session_header(session_id: str, state: str) -> str:
     return f"<b>Session</b> <code>{safe_session_id}</code> | <b>State</b> <code>{safe_state}</code>"
 
 
+URL_LIKE_RE = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|www\.)\S+$", re.IGNORECASE)
+PROXY_LINK_RE = re.compile(r"^(?:vless|vmess|trojan|ss|hy2|tuic)://\S+$", re.IGNORECASE)
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+HEX_HASH_RE = re.compile(r"^[0-9a-f]{7,128}$", re.IGNORECASE)
+IP_PORT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}$")
+DOMAIN_PORT_RE = re.compile(r"^[a-z0-9.-]+:\d{1,5}$", re.IGNORECASE)
+PATH_LIKE_RE = re.compile(r"^(?:~?/|\.{1,2}/|/)\S+$")
+ENV_EXPORT_RE = re.compile(r"^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:.+)?$")
+KV_LINE_RE = re.compile(r"^(\s*[A-Za-z0-9_.-]+)(\s*(?:=|:)\s*)(.+)$")
+HISTORY_LINE_RE = re.compile(r"^(\s*\d+\*?)(\s+)(.+)$")
+LOG_LINE_RE = re.compile(
+    r"^(\s*(?:\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+|[A-Z][a-z]{2}\s+\d+\s+[0-9:]{8}))"
+    r"(\s+)([A-Z]+|debug|info|warn|warning|error|fatal|trace)?"
+    r"(\s*)(.*)$",
+    re.IGNORECASE,
+)
+SYSTEMD_UNIT_RE = re.compile(r"^[A-Za-z0-9_.@-]+\.(?:service|socket|timer|target|mount|path|slice|scope)$")
+CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$", re.IGNORECASE)
+SHELL_SNIPPET_RE = re.compile(r"(?:\|\||&&|[|;<>]|2>/dev/null|\$\(|`)")
+BLOCK_HINT_RE = re.compile(r"^\s*(?:[{[]|[-*]\s|\w+:\s|\w+=)")
+OUTPUT_LINE_ENTITY_SOFT_LIMIT = 18
+
+
 def normalize_output_token(token: str) -> str:
     if len(token) < 2:
         return token
@@ -609,21 +645,279 @@ def normalize_output_parts(parts: list[str]) -> list[str]:
 
 
 def render_output_lines(output: str) -> str:
+    return "\n".join(fragment.html for fragment in render_output_fragments(output))
+
+
+def render_output_fragments(output: str) -> list[RenderedOutputLine]:
     lines = (output or "[no output]").splitlines() or ["[no output]"]
-    rendered: list[str] = []
+    rendered_lines: list[RenderedOutputLine] = []
     for line in lines:
-        if not line:
-            rendered.append("<code> </code>")
-            continue
+        for fragment in split_output_line_for_rendering(line):
+            rendered_lines.append(render_output_line(fragment))
+    return rendered_lines
 
-        parts = [part for part in re.split(r"\s+", line.strip()) if part]
-        if not parts:
-            rendered.append("<code> </code>")
-            continue
 
-        normalized_parts = normalize_output_parts(parts)
-        rendered.append(" ".join(f"<code>{escape(part)}</code>" for part in normalized_parts))
-    return "\n".join(rendered)
+def count_rendered_output_entities(output: str) -> int:
+    return sum(fragment.entity_count for fragment in render_output_fragments(output))
+
+
+def _split_history_line(line: str) -> tuple[str, str] | None:
+    match = HISTORY_LINE_RE.match(line)
+    if not match:
+        return None
+    index, _, command = match.groups()
+    if not command:
+        return None
+    return index, command
+
+
+def _looks_like_url(value: str) -> bool:
+    return bool(URL_LIKE_RE.match(value))
+
+
+def _looks_like_proxy_link(value: str) -> bool:
+    return bool(PROXY_LINK_RE.match(value))
+
+
+def _looks_like_identifier(value: str) -> bool:
+    return bool(
+        UUID_RE.match(value)
+        or HEX_HASH_RE.match(value)
+        or IP_PORT_RE.match(value)
+        or DOMAIN_PORT_RE.match(value)
+        or SYSTEMD_UNIT_RE.match(value)
+        or CONTAINER_ID_RE.match(value)
+    )
+
+
+def _looks_like_path(value: str) -> bool:
+    return bool(PATH_LIKE_RE.match(value))
+
+
+def _is_shell_snippet_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if ENV_EXPORT_RE.match(stripped):
+        return True
+    if _looks_like_proxy_link(stripped):
+        return True
+    return bool(SHELL_SNIPPET_RE.search(stripped))
+
+
+def _is_block_like_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if len(stripped) >= 90 and (stripped.startswith("{") or stripped.startswith("[")):
+        return True
+    if len(stripped) >= 120 and BLOCK_HINT_RE.match(stripped):
+        return True
+    if stripped.startswith(("-----BEGIN ", "-----END ")):
+        return True
+    return False
+
+
+def _split_preserving_spaces(text: str) -> list[str]:
+    return re.findall(r"\s+|[^\s]+", text)
+
+
+def _build_code_join(parts: list[str]) -> RenderedOutputLine:
+    html_parts: list[str] = []
+    entity_count = 0
+    for part in parts:
+        if not part:
+            continue
+        if part.isspace():
+            html_parts.append(part)
+            continue
+        html_parts.append(f"<code>{escape(part)}</code>")
+        entity_count += 1
+    if not html_parts:
+        return RenderedOutputLine("<code> </code>", 1, mode="token")
+    return RenderedOutputLine("".join(html_parts), max(1, entity_count), mode="token")
+
+
+def _render_line_mode(line: str) -> RenderedOutputLine:
+    if not line:
+        return RenderedOutputLine("<code> </code>", 1, mode="line")
+    return RenderedOutputLine(f"<code>{escape(line)}</code>", 1, mode="line")
+
+
+def _render_history_line(line: str) -> RenderedOutputLine | None:
+    history_line = _split_history_line(line)
+    if history_line is None:
+        return None
+    index, command = history_line
+    return RenderedOutputLine(
+        f"<code>{escape(index)}</code> <code>{escape(command)}</code>",
+        2,
+        mode="history",
+    )
+
+
+def _render_key_value_line(line: str) -> RenderedOutputLine | None:
+    match = KV_LINE_RE.match(line)
+    if not match:
+        return None
+    key, separator, value = match.groups()
+    if not value.strip():
+        return None
+    return RenderedOutputLine(
+        f"<code>{escape(key.strip())}</code>{escape(separator)}<code>{escape(value.strip())}</code>",
+        2,
+        mode="kv",
+    )
+
+
+def _render_column_line(line: str) -> RenderedOutputLine | None:
+    if "\t" not in line and not re.search(r"\S(?: {2,}|\t)\S", line):
+        return None
+    pieces = re.split(r"(\t+| {2,})", line)
+    if len(pieces) <= 1:
+        return None
+    rendered = _build_code_join(pieces)
+    rendered.mode = "columns"
+    return rendered
+
+
+def _render_standalone_value_line(line: str) -> RenderedOutputLine | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    if _looks_like_url(stripped) or _looks_like_proxy_link(stripped) or _looks_like_path(stripped):
+        return RenderedOutputLine(f"<code>{escape(stripped)}</code>", 1, mode="standalone")
+    if _looks_like_identifier(stripped):
+        return RenderedOutputLine(f"<code>{escape(stripped)}</code>", 1, mode="standalone")
+    return None
+
+
+def _render_log_like_line(line: str) -> RenderedOutputLine | None:
+    match = LOG_LINE_RE.match(line)
+    if not match:
+        return None
+    timestamp, spacing, level, level_spacing, message = match.groups()
+    if not message:
+        return None
+    html = f"<code>{escape(timestamp.strip())}</code>{escape(spacing)}"
+    entity_count = 1
+    if level:
+        html += f"<code>{escape(level)}</code>{escape(level_spacing or ' ')}"
+        entity_count += 1
+    html += f"<code>{escape(message)}</code>"
+    return RenderedOutputLine(html, entity_count + 1, mode="log")
+
+
+def _merge_plain_words(tokens: list[str]) -> list[str]:
+    merged: list[str] = []
+    buffer: list[str] = []
+    for token in tokens:
+        if (
+            token
+            and token.replace(".", "", 1).replace("-", "", 1).isalnum()
+            and not _looks_like_url(token)
+            and not _looks_like_path(token)
+            and not _looks_like_identifier(token)
+        ):
+            buffer.append(token)
+            continue
+        if buffer:
+            merged.append(" ".join(buffer))
+            buffer = []
+        merged.append(token)
+    if buffer:
+        merged.append(" ".join(buffer))
+    return merged
+
+
+def _render_token_line(line: str) -> RenderedOutputLine:
+    if not line:
+        return RenderedOutputLine("<code> </code>", 1, mode="token")
+    raw_parts = [part for part in re.split(r"\s+", line.strip()) if part]
+    if not raw_parts:
+        return RenderedOutputLine("<code> </code>", 1, mode="token")
+    normalized_parts = normalize_output_parts(raw_parts)
+    merged_parts = _merge_plain_words(normalized_parts)
+    return _build_code_join(_split_preserving_spaces(" ".join(merged_parts)))
+
+
+def _classify_output_line(line: str) -> str:
+    if not line:
+        return "empty"
+    if _split_history_line(line) is not None:
+        return "history"
+    if KV_LINE_RE.match(line):
+        return "kv"
+    if _render_column_line(line) is not None:
+        return "columns"
+    if LOG_LINE_RE.match(line):
+        return "log"
+    stripped = line.strip()
+    if stripped and _render_standalone_value_line(stripped) is not None:
+        return "standalone"
+    if _is_shell_snippet_line(line):
+        return "shell"
+    if _is_block_like_line(line):
+        return "block"
+    return "token"
+
+
+def render_output_line(line: str) -> RenderedOutputLine:
+    if not line:
+        return RenderedOutputLine("<code> </code>", 1, mode="empty")
+
+    line_kind = _classify_output_line(line)
+    if line_kind == "history":
+        rendered = _render_history_line(line)
+        if rendered is not None:
+            return rendered
+    if line_kind == "kv":
+        rendered = _render_key_value_line(line)
+        if rendered is not None:
+            return rendered
+    if line_kind == "columns":
+        rendered = _render_column_line(line)
+        if rendered is not None:
+            return rendered
+    if line_kind == "log":
+        rendered = _render_log_like_line(line)
+        if rendered is not None:
+            return rendered
+    if line_kind == "standalone":
+        rendered = _render_standalone_value_line(line)
+        if rendered is not None:
+            return rendered
+    if line_kind in {"shell", "block"}:
+        return _render_line_mode(line)
+
+    rendered = _render_token_line(line)
+    if rendered.entity_count > OUTPUT_LINE_ENTITY_SOFT_LIMIT:
+        return _render_line_mode(line)
+    return rendered
+
+
+def split_output_line_for_rendering(line: str, max_chars: int = RENDER_LINE_SPLIT_MAX_CHARS) -> list[str]:
+    if len(line) <= max_chars:
+        return [line]
+    remaining = line
+    chunks: list[str] = []
+    while len(remaining) > max_chars:
+        split_at = remaining.rfind(" ", 0, max_chars + 1)
+        if split_at < max_chars // 2:
+            split_at = remaining.rfind("/", 0, max_chars + 1)
+        if split_at < max_chars // 2:
+            split_at = remaining.rfind(",", 0, max_chars + 1)
+        if split_at < max_chars // 2:
+            split_at = max_chars
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:max_chars]
+            split_at = len(chunk)
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def run_oneshot_shell_command(
@@ -725,16 +1019,6 @@ def format_session_result(
     )
 
 
-def _render_output_line(line: str) -> str:
-    if not line:
-        return "<code> </code>"
-    parts = [part for part in re.split(r"\s+", line.strip()) if part]
-    if not parts:
-        return "<code> </code>"
-    normalized_parts = normalize_output_parts(parts)
-    return " ".join(f"<code>{escape(part)}</code>" for part in normalized_parts)
-
-
 def build_session_result_chunks(
     session_id: str,
     state: str,
@@ -752,20 +1036,25 @@ def build_session_result_chunks(
         f"<b>Current dir:</b> <code>{safe_cwd}</code>\n"
         f"<b>Output</b>\n"
     )
-    lines = (output or "[no output]").splitlines() or ["[no output]"]
-    rendered_lines = [_render_output_line(line) for line in lines]
+    rendered_lines = render_output_fragments(output)
 
     chunks: list[str] = []
     current = header
+    current_entities = 4
     for rendered in rendered_lines:
-        piece = f"{rendered}\n"
-        if len(current) + len(piece) <= max_chars:
+        piece = f"{rendered.html}\n"
+        if (
+            len(current) + len(piece) <= max_chars
+            and current_entities + rendered.entity_count <= RESULT_CHUNK_MAX_ENTITIES
+        ):
             current += piece
+            current_entities += rendered.entity_count
             continue
         if current.strip():
             chunks.append(current.rstrip())
         # Continuation messages contain only output body for readability.
         current = piece
+        current_entities = rendered.entity_count
     if current.strip():
         chunks.append(current.rstrip())
     return chunks
@@ -986,6 +1275,34 @@ def build_stream_frame_text(session: Session, now: datetime) -> str:
             f"{render_output_lines(body)}"
         )
     return render_output_lines(body)
+
+
+def _split_stream_body_for_entity_budget(body: str) -> tuple[str, str] | None:
+    if not body:
+        return None
+    lines = body.splitlines(keepends=True)
+    if len(lines) < 2:
+        return None
+
+    head_lines: list[str] = []
+    head_entities = 0
+    for line in lines:
+        candidate = line.rstrip("\n")
+        fragment_entities = count_rendered_output_entities(candidate)
+        if head_lines and head_entities + fragment_entities > STREAM_FRAME_MAX_BODY_ENTITIES:
+            break
+        head_lines.append(line)
+        head_entities += fragment_entities
+
+    if len(head_lines) >= len(lines):
+        return None
+
+    split_at = sum(len(line) for line in head_lines)
+    head = body[:split_at].rstrip("\n")
+    tail = body[split_at:].lstrip("\n")
+    if not head or not tail:
+        return None
+    return head, tail
 
 
 async def upsert_stream_frame_message(
@@ -1214,6 +1531,19 @@ async def stream_session_output(
             session.stream_frame_body += char
             if char == "\n":
                 session.stream_current_line_start = len(session.stream_frame_body)
+                split_body = _split_stream_body_for_entity_budget(session.stream_frame_body)
+                if split_body is not None:
+                    head, tail = split_body
+                    session.stream_frame_body = head
+                    session.stream_current_line_start = len(session.stream_frame_body)
+                    await stream_rollover_frame(
+                        session,
+                        bot,
+                        now=now,
+                        stream_enabled=stream_enabled,
+                    )
+                    session.stream_frame_body = tail
+                    session.stream_current_line_start = len(session.stream_frame_body)
 
         with contextlib.suppress(Exception):
             await upsert_stream_frame_message(
