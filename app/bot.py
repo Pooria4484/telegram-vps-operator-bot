@@ -46,6 +46,7 @@ CONTEXT_CONTROL_PREFIX = "ctxctl"
 SESSION_LIST_PREFIX = "sesslist"
 SESSION_PAGE_PREFIX = "sesspage"
 KILL_CONFIRM_PREFIX = "killcfm"
+SHELL_PICKER_PREFIX = "shellpick"
 SESSION_STREAM_INTERVAL_SECONDS = 1.0
 STREAM_FRAME_MAX_BODY_CHARS = 2400
 RESULT_CHUNK_MAX_CHARS = 3600
@@ -61,6 +62,7 @@ BTN_CTRL_D = "Ctrl+D"
 BTN_ENTER = "Enter"
 BTN_STREAM = "Stream"
 BTN_HELP = "Help"
+BTN_SHELL = "Open Shell"
 
 QUICK_ACTION_BY_TEXT: dict[str, str] = {
     BTN_STATUS: "status",
@@ -73,6 +75,7 @@ QUICK_ACTION_BY_TEXT: dict[str, str] = {
     BTN_ENTER: "enter",
     BTN_STREAM: "stream_toggle",
     BTN_HELP: "help",
+    BTN_SHELL: "shell_menu",
 }
 
 
@@ -180,6 +183,7 @@ def persistent_control_keyboard() -> ReplyKeyboardMarkup:
             ],
             [
                 KeyboardButton(text=BTN_STREAM),
+                KeyboardButton(text=BTN_SHELL),
                 KeyboardButton(text=BTN_HELP),
             ],
         ],
@@ -269,6 +273,17 @@ def context_control_keyboard(*actions: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else InlineKeyboardMarkup(inline_keyboard=[])
 
 
+def shell_picker_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Start zsh", callback_data=f"{SHELL_PICKER_PREFIX}:zsh"),
+                InlineKeyboardButton(text="Start bash", callback_data=f"{SHELL_PICKER_PREFIX}:bash"),
+            ]
+        ]
+    )
+
+
 def parse_context_control_callback(data: str | None) -> str | None:
     if not data:
         return None
@@ -283,12 +298,32 @@ def parse_context_control_callback(data: str | None) -> str | None:
     return action
 
 
+def parse_shell_picker_callback(data: str | None) -> str | None:
+    if not data:
+        return None
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return None
+    prefix, shell_name = parts
+    if prefix != SHELL_PICKER_PREFIX:
+        return None
+    if shell_name not in {"zsh", "bash"}:
+        return None
+    return shell_name
+
+
 def sessions_list_keyboard(
     session_ids: list[str],
     page: int,
     total_pages: int,
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
+    rows.append(
+        [
+            InlineKeyboardButton(text="New zsh", callback_data=f"{SHELL_PICKER_PREFIX}:zsh"),
+            InlineKeyboardButton(text="New bash", callback_data=f"{SHELL_PICKER_PREFIX}:bash"),
+        ]
+    )
     for session_id in session_ids:
         rows.append(
             [
@@ -612,9 +647,10 @@ def run_oneshot_shell_command(
 async def answer_no_active_session(message: Message, current_dir: Path) -> None:
     await message.answer(
         f"<b>No active session</b>\n"
-        f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>",
+        f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
+        f"<b>Quick start:</b> choose a shell below.",
         parse_mode="HTML",
-        reply_markup=persistent_control_keyboard(),
+        reply_markup=shell_picker_keyboard(),
     )
 
 
@@ -1276,6 +1312,106 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         candidate = parts[1].strip()
         return candidate or None
 
+    async def do_start_shell(message: Message, user_id: int, shell_name: str) -> None:
+        shell_name = shell_name.strip().lower()
+        if shell_name not in {"zsh", "bash"}:
+            await message.answer("Unsupported shell.")
+            return
+
+        current_dir = session_manager.get_current_workdir(user_id)
+        active = session_manager.get_active_session_for_user(user_id)
+        if active:
+            await answer_active_session_exists(message, active.session_id)
+            return
+
+        running_count = session_manager.count_running_sessions_for_user(user_id)
+        if running_count >= settings.max_running_sessions_per_user:
+            await message.answer(
+                f"<b>Run blocked</b>\n"
+                f"<b>Reason:</b> <code>running session limit reached</code>\n"
+                f"<b>Running:</b> <code>{running_count}/{settings.max_running_sessions_per_user}</code>\n"
+                f"<b>Use:</b> <code>/sessions</code> then stop/attach/detach as needed.",
+                parse_mode="HTML",
+            )
+            return
+
+        session = session_manager.create_session(
+            telegram_user_id=user_id,
+            chat_id=message.chat.id,
+            command=shell_name,
+            max_session_history_per_user=settings.max_session_history_per_user,
+        )
+        logger.info(
+            "Starting quick shell session: user_id=%s session_id=%s command=%r cwd=%s",
+            user_id,
+            session.session_id,
+            shell_name,
+            current_dir,
+        )
+        try:
+            live = await start_live_command(
+                command=shell_name,
+                shell=settings.default_shell,
+                cwd=current_dir,
+            )
+        except Exception as exc:
+            session.state = "failed"
+            session.ended_at = session_manager.now()
+            session_manager.append_output_text(
+                session,
+                f"ERROR: {exc!r}\n",
+                settings.max_tail_lines,
+            )
+            session_manager.finish_session(session)
+            logger.exception(
+                "Failed to start quick shell session: user_id=%s session_id=%s command=%r cwd=%s",
+                user_id,
+                session.session_id,
+                shell_name,
+                current_dir,
+            )
+            tail_lines = session_manager.get_tail_snapshot(session, settings.max_tail_lines)
+            tail_text = "\n".join(tail_lines) if tail_lines else "[no output]"
+            chunks = build_session_result_chunks(
+                session_id=session.session_id,
+                state=session.state,
+                exit_code=session.exit_code,
+                cwd=str(current_dir),
+                output=tail_text,
+            )
+            for chunk in chunks:
+                await message.answer(chunk, parse_mode="HTML")
+            return
+
+        session.state = "running"
+        session.process = live.process
+        session.pty_master_fd = live.pty_master_fd
+        reset_stream_frame_state(session)
+        session.is_attached = True
+        session_manager.save_session(session)
+        session.reader_task = asyncio.create_task(
+            read_session_output(session, session_manager, settings.max_tail_lines)
+        )
+        session.streamer_task = asyncio.create_task(
+            stream_session_output(session, session_manager, message.bot)
+        )
+        session.waiter_task = asyncio.create_task(
+            wait_session_exit(session, session_manager, settings, message.bot)
+        )
+
+        await message.answer(
+            format_live_start_message(
+                session_id=session.session_id,
+                state=session.state,
+                pid=live.process.pid,
+                cwd=str(current_dir),
+                command=shell_name,
+                stream_enabled=session_manager.is_stream_enabled(user_id),
+            ),
+            parse_mode="HTML",
+            reply_markup=session_control_keyboard_main(session.session_id),
+        )
+
     async def do_help(message: Message, user_id: int) -> None:
         current_dir = session_manager.get_current_workdir(user_id)
         await message.answer(
@@ -1733,6 +1869,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "- send a file directly\n"
             "- it will be saved in your current dir\n\n"
             f"Current dir: {current_dir}",
+            reply_markup=shell_picker_keyboard(),
+        )
+        await message.answer(
+            "Quick action controls are available on your keyboard.",
             reply_markup=persistent_control_keyboard(),
         )
 
@@ -2249,6 +2389,21 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         await do_tail(callback.message, user.id)
         await callback.answer("Tail sent.", show_alert=False)
 
+    @dp.callback_query(F.data.startswith(f"{SHELL_PICKER_PREFIX}:"))
+    async def shell_picker_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        shell_name = parse_shell_picker_callback(callback.data)
+        if shell_name is None:
+            await callback.answer("Invalid shell.", show_alert=False)
+            return
+        if not callback.message:
+            await callback.answer("No message context.", show_alert=False)
+            return
+        await do_start_shell(callback.message, user.id, shell_name)
+        await callback.answer(f"{shell_name} requested.", show_alert=False)
+
     @dp.callback_query(F.data.startswith(f"{SESSION_LIST_PREFIX}:"))
     async def session_list_control_handler(callback: CallbackQuery) -> None:
         user = callback.from_user
@@ -2428,6 +2583,14 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if action == "stream_toggle":
             await do_stream_mode(message, user.id, "toggle")
             return
+        if action == "shell_menu":
+            await message.answer(
+                "<b>Choose a shell</b>\n"
+                "<b>Use:</b> quick start for a new interactive session.",
+                parse_mode="HTML",
+                reply_markup=shell_picker_keyboard(),
+            )
+            return
 
     @dp.message(Command("run"))
     async def run_handler(message: Message) -> None:
@@ -2450,6 +2613,10 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 "Usage: /run <command>",
                 reply_markup=context_control_keyboard("help", "status"),
             )
+            return
+
+        if command in {"zsh", "bash"}:
+            await do_start_shell(message, user.id, command)
             return
 
         current_dir = session_manager.get_current_workdir(user.id)
