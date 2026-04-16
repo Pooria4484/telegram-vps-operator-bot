@@ -136,12 +136,12 @@ Stage under test: Phase 6 persistence + quick shell UX + smart output rendering
 - run `ss -tulpn` or `journalctl -n 20`
 - expected: structured output remains readable and does not fall back to broken plain formatting
 
-24. Codex slash-command routing
+24. Codex accidental-exit handling
 - start `codex`
-- send `!/init`
-- expected: slash command is forwarded to codex
-- send a normal bot command like `/status`
-- expected: bot handles it as a bot command, not as codex input
+- press `Ctrl+D`
+- expected: bot sends a quit request and codex exits
+- if codex does not leave immediately, press `Stop`
+- expected: session is stopped from bot controls
 
 25. Unauthorized user check (negative test)
 - from a Telegram user outside whitelist, send `/id` or `/run ls`

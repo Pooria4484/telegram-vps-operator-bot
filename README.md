@@ -103,8 +103,7 @@ Quick shell actions:
   - then send plain text commands such as `pwd`
 
 - Codex session note:
-  - bot slash commands still use `/...`
-  - inside a `codex` session, use `!/init`, `!/status`, and similar to send codex slash commands
+  - if you start `codex` by mistake, use `Ctrl+D`, `Stop`, or `Kill` from the bot controls to leave it
 
 ## Installation
 

@@ -972,16 +972,6 @@ def format_live_start_message(
     stream_enabled: bool,
 ) -> str:
     stream_mode = "on" if stream_enabled else "off"
-    codex_hint = ""
-    try:
-        parts = shlex.split(command)
-        if parts and Path(parts[0]).name.lower() == "codex":
-            codex_hint = (
-                "\n<b>Codex hint:</b> use <code>!/...</code> for codex slash commands "
-                "(example: <code>!/init</code>)"
-            )
-    except Exception:
-        pass
     return (
         f"<b>Live Session Started</b>\n"
         f"{format_session_header(session_id, state)}\n"
@@ -992,7 +982,6 @@ def format_live_start_message(
         f"<b>Stream mode:</b> <code>{stream_mode}</code> "
         f"(toggle with <code>/stream toggle</code>)\n"
         f"<b>Interactive:</b> send plain text to active session (example: <code>ls</code>)\n"
-        f"{codex_hint}"
         f"<b>Tip:</b> use <code>/tail</code>, <code>/status</code>, <code>/stop</code>, "
         f"<code>/ctrl c</code>, <code>/ctrl d</code>, <code>/n</code>, <code>/stream status</code>"
     )
@@ -1146,9 +1135,7 @@ def format_help_message(current_dir: Path) -> str:
         "• ارسال فایل: آپلود فایل در مسیر کاری فعلی شما\n"
         "  مثال: فایل را مستقیم در چت ارسال کنید\n"
         "• متن ساده در حالت سشن فعال: به stdin همان سشن ارسال می‌شود\n"
-        "  مثال: بعد از <code>/run bash</code> پیام <code>pwd</code> بفرستید\n"
-        "• نکته Codex: برای اسلش‌های codex از <code>!/...</code> استفاده کنید\n"
-        "  مثال: <code>!/init</code> یا <code>!/status</code>\n\n"
+        "  مثال: بعد از <code>/run bash</code> پیام <code>pwd</code> بفرستید\n\n"
         "<b>English (with examples)</b>\n"
         "• <code>/help</code>: show this help\n"
         "  Example: <code>/help</code>\n"
@@ -1193,9 +1180,7 @@ def format_help_message(current_dir: Path) -> str:
         "• File upload: send a file directly in chat\n"
         "  Example: upload <code>deploy.sh</code> to current dir\n"
         "• Plain text while a session is active: forwarded to session stdin\n"
-        "  Example: run <code>/run zsh</code>, then send <code>ls</code>\n"
-        "• Codex note: use <code>!/...</code> for codex slash commands\n"
-        "  Example: <code>!/init</code> or <code>!/status</code>\n\n"
+        "  Example: run <code>/run zsh</code>, then send <code>ls</code>\n\n"
         f"<b>Current dir:</b> <code>{safe_dir}</code>"
     )
 
@@ -2037,7 +2022,12 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         if session_manager.is_stream_enabled(user_id):
             reset_stream_state_for_new_input(session, session_manager)
-        if not send_ctrl_c(process):
+        ctrl_c_sent = send_ctrl_c(process)
+        if is_codex_session_command(session.command):
+            master_fd = session.pty_master_fd
+            if master_fd is not None:
+                ctrl_c_sent = send_pty_input(master_fd, b"\x03") or ctrl_c_sent
+        if not ctrl_c_sent:
             await message.answer("Could not send Ctrl+C. Process is no longer running.")
             return
 
@@ -2057,6 +2047,13 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         if session_manager.is_stream_enabled(user_id):
             reset_stream_state_for_new_input(session, session_manager)
+        if is_codex_session_command(session.command):
+            if not send_pty_input(master_fd, b"q\r"):
+                await message.answer("Could not send codex quit request. PTY is no longer available.")
+                return
+            await message.answer(f"Sent quit request to codex session {session.session_id}.")
+            return
+
         if not send_pty_input(master_fd, b"\x04"):
             await message.answer("Could not send Ctrl+D. PTY is no longer available.")
             return
@@ -2077,8 +2074,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         if session_manager.is_stream_enabled(user_id):
             reset_stream_state_for_new_input(session, session_manager)
-        enter_payload = b"\r" if is_codex_session_command(session.command) else b"\n"
-        if not send_pty_input(master_fd, enter_payload):
+        if not send_pty_input(master_fd, b"\n"):
             await message.answer("Could not send Enter. PTY is no longer available.")
             return
 
@@ -2194,7 +2190,6 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             "/get <path>\n"
             "/status [session_id]\n"
             "/tail [session_id]\n\n"
-            "Codex in active session: use !/... for codex slash commands (example: !/init)\n\n"
             "Upload behavior:\n"
             "- send a file directly\n"
             "- it will be saved in your current dir\n\n"
@@ -3142,19 +3137,14 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             text = message.text or ""
             if not text:
                 return
-            outbound = text
-            if is_codex_session_command(session.command) and outbound.startswith("!/"):
-                outbound = "/" + outbound[2:]
-
             if session_manager.is_stream_enabled(user.id):
                 reset_stream_state_for_new_input(session, session_manager)
-            stripped = outbound.strip()
+            stripped = text.strip()
             if stripped:
                 session.pending_echo_inputs.append(stripped)
                 if len(session.pending_echo_inputs) > 20:
                     session.pending_echo_inputs = session.pending_echo_inputs[-20:]
-            line_ending = b"\r" if is_codex_session_command(session.command) else b"\n"
-            data = outbound.encode(errors="replace") + line_ending
+            data = text.encode(errors="replace") + b"\n"
             if not send_pty_input(master_fd, data):
                 await message.answer("Could not send text to active session.")
             return
@@ -3179,15 +3169,6 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
     async def unknown_slash_handler(message: Message) -> None:
         user = message.from_user
         if not user or not is_allowed(user.id, settings):
-            return
-        session = session_manager.get_active_session_for_user(user.id)
-        if session and is_codex_session_command(session.command):
-            await message.answer(
-                "<b>Codex slash hint</b>\n"
-                "For codex internal slash commands, use <code>!/...</code>\n"
-                "Example: <code>!/init</code>, <code>!/status</code>",
-                parse_mode="HTML",
-            )
             return
         await message.answer(
             "Unknown command.\nUse <code>/help</code>.",
