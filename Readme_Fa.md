@@ -51,6 +51,7 @@
 - `/stream on|off|toggle|status` مدیریت استریم خروجی
 - `/live ...` نام جایگزین برای `/stream ...`
 - `/get <path>` دریافت فایل از VPS
+- `/codex <task>` اجرای Codex به‌صورت non-interactive روی مسیر فعلی
 
 رفتار بافر:
 - در حالت stream `on` قبل از هر ورودی تعاملی جدید، بافر پاک می‌شود.
@@ -66,6 +67,28 @@
 - خط‌های `key=value` یا `key: value` به‌صورت key + value رندر می‌شوند، نه کلمه‌به‌کلمه.
 - خروجی‌های table-like و log-like هم تا جای ممکن ساختار monospace خوانا را حفظ می‌کنند.
 
+رفتار Codex:
+- با `/codex <task>`، Codex به‌صورت non-interactive در مسیر کاری فعلی شما اجرا می‌شود.
+- دکمه شیشه‌ای `Codex` مسیر اصلی UX است و یک panel برای workspace و وضعیت Codex باز می‌کند.
+- مسیر دیفالت Codex همان دایرکتوری‌ای است که کاربر هنگام زدن دکمه `Codex` در آن قرار دارد.
+- از داخل panel می‌توان:
+  - با ارسال مستقیم متن task را شروع کرد
+  - حالت continue/new را تغییر داد
+  - مدل را از لیست دکمه‌ای انتخاب کرد
+  - سطح reasoning effort را انتخاب کرد (`low`/`medium`/`high` و قابل تنظیم)
+  - مسیر را عوض کرد
+  - وضعیت/session فعلی را دید
+  - لاگ/Retry/Changes/Files/Patch آخرین run را گرفت
+  - run فعال را cancel کرد
+  - session فعلی را بست
+- اگر سشن Codex فعال باشد و shell/PTTY فعالی نداشته باشید، متن ساده‌ی بعدی به‌صورت خودکار ادامه همان گفت‌وگوی Codex حساب می‌شود.
+- اگر shell/PTTY فعال باشد، متن ساده همچنان اول به shell می‌رود و رفتار تعاملی فعلی حفظ می‌شود.
+- علاوه بر دکمه‌های شیشه‌ای، زیر پیام نتیجه‌ی Codex هم inline actionهای بعد از اجرا (`Retry`، `Logs`، `Changes`، `Files`، `Export Patch`) نمایش داده می‌شود.
+- مدل انتخاب‌شده هر Codex run در SQLite ذخیره می‌شود تا گزارش وضعیت/لاگ همیشه دقیق باشد.
+- reasoning effort انتخاب‌شده هم برای هر Codex run در SQLite ذخیره می‌شود.
+- لیست پیش‌فرض مدل‌ها (اگر env ست نشده باشد): `gpt-5.4`، `gpt-5.4-mini`، `gpt-5.3-codex`، `gpt-5.2`.
+- لیست پیش‌فرض effortها (اگر env ست نشده باشد): `low`، `medium`، `high`، `xhigh`.
+
 ## کیبورد اکشن سریع
 
 دکمه‌های فعلی پایین چت:
@@ -80,6 +103,7 @@
 - `Stream`
 - `Help`
 - `Open Shell`
+- `Codex`
 
 اکشن‌های سریع شل:
 - با `Open Shell` یک picker برای `zsh` و `bash` باز می‌شود.

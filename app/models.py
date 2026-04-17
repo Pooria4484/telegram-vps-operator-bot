@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 
 SessionState = Literal["starting", "running", "finished", "failed", "stopped"]
 SessionMode = Literal["exec"]
+CodexSessionState = Literal["active", "closed"]
+CodexSessionMode = Literal["continue", "new"]
+CodexRunStatus = Literal["queued", "running", "success", "partial", "failed", "cancelled"]
 
 
 @dataclass(slots=True)
@@ -38,3 +42,43 @@ class Session:
     stream_frame_body: str = ""
     stream_current_line_start: int = 0
     pending_echo_inputs: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class CodexSession:
+    codex_session_id: str
+    telegram_chat_id: int
+    telegram_user_id: int
+    workspace_path: Path
+    state: CodexSessionState = "active"
+    default_mode: CodexSessionMode = "continue"
+    default_model: str = ""
+    default_reasoning_effort: str = ""
+    thread_ref: str | None = None
+    last_run_id: str | None = None
+    last_prompt: str = ""
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    ended_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class CodexRun:
+    codex_run_id: str
+    codex_session_id: str
+    telegram_chat_id: int
+    telegram_user_id: int
+    workspace_path: Path
+    prompt_text: str
+    run_mode: CodexSessionMode = "continue"
+    model_name: str = ""
+    reasoning_effort: str = ""
+    status: CodexRunStatus = "queued"
+    summary_short: str = ""
+    started_at: datetime = field(default_factory=datetime.utcnow)
+    ended_at: datetime | None = None
+    exit_code: int | None = None
+    stdout_artifact_path: Path | None = None
+    stderr_artifact_path: Path | None = None
+    structured_result_json: str = ""
+    failure_summary: str = ""

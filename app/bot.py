@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import escape
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import secrets
 import shlex
 import signal
 import subprocess
+from typing import Literal
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -30,6 +32,7 @@ from aiogram.types import (
 )
 
 from app.auth import is_allowed
+from app.codex_runner import CodexRunConflictError, CodexRunner
 from app.command_runner import (
     build_command_env,
     send_ctrl_c,
@@ -38,7 +41,7 @@ from app.command_runner import (
     stop_live_command,
 )
 from app.config import Settings
-from app.models import Session
+from app.models import CodexRun, CodexSession, Session
 from app.session_manager import PendingUpload, SessionManager, sanitize_terminal_text
 
 SESSION_CONTROL_PREFIX = "sessctl"
@@ -47,6 +50,7 @@ SESSION_LIST_PREFIX = "sesslist"
 SESSION_PAGE_PREFIX = "sesspage"
 KILL_CONFIRM_PREFIX = "killcfm"
 SHELL_PICKER_PREFIX = "shellpick"
+CODEX_RESULT_PREFIX = "codexr"
 SESSION_STREAM_INTERVAL_SECONDS = 1.0
 STREAM_FRAME_MAX_BODY_CHARS = 2400
 STREAM_FRAME_MAX_BODY_ENTITIES = 80
@@ -66,6 +70,25 @@ BTN_ENTER = "Enter"
 BTN_STREAM = "Stream"
 BTN_HELP = "Help"
 BTN_SHELL = "Open Shell"
+BTN_CODEX = "Codex"
+BTN_CODEX_DIR = "Dir"
+BTN_CODEX_MODE = "Mode"
+BTN_CODEX_MODEL = "Model"
+BTN_CODEX_RUN_TOOLS = "Run Tools"
+BTN_CODEX_REVIEW = "Review"
+BTN_CODEX_INFO = "Info"
+BTN_CODEX_STATUS = "Run Status"
+BTN_CODEX_LOGS = "Logs"
+BTN_CODEX_RETRY = "Retry"
+BTN_CODEX_CHANGES = "Changes"
+BTN_CODEX_FILES = "Files"
+BTN_CODEX_PATCH = "Patch"
+BTN_CODEX_CANCEL = "Cancel Run"
+BTN_CODEX_END = "End Session"
+BTN_CODEX_APPROVE = "Approve"
+BTN_CODEX_REJECT = "Reject"
+BTN_CODEX_ALLOW = "Allow Session"
+BTN_BACK = "Back"
 
 QUICK_ACTION_BY_TEXT: dict[str, str] = {
     BTN_STATUS: "status",
@@ -79,6 +102,26 @@ QUICK_ACTION_BY_TEXT: dict[str, str] = {
     BTN_STREAM: "stream_toggle",
     BTN_HELP: "help",
     BTN_SHELL: "shell_menu",
+    BTN_CODEX: "codex_panel",
+    BTN_CODEX_DIR: "codex_dir",
+    BTN_CODEX_MODE: "codex_mode",
+    BTN_CODEX_MODEL: "codex_model",
+    BTN_CODEX_RUN_TOOLS: "codex_run_tools",
+    BTN_CODEX_REVIEW: "codex_review",
+    BTN_CODEX_INFO: "codex_info",
+    BTN_CODEX_STATUS: "codex_status",
+    BTN_CODEX_LOGS: "codex_logs",
+    BTN_CODEX_RETRY: "codex_retry",
+    BTN_CODEX_CHANGES: "codex_changes",
+    BTN_CODEX_FILES: "codex_files",
+    BTN_CODEX_PATCH: "codex_patch",
+    BTN_CODEX_CANCEL: "codex_cancel",
+    BTN_CODEX_END: "codex_end",
+    BTN_CODEX_APPROVE: "codex_approve",
+    BTN_CODEX_REJECT: "codex_reject",
+    BTN_CODEX_ALLOW: "codex_allow",
+    BTN_BACK: "back_main",
+    "Settings": "codex_run_tools",
 }
 
 
@@ -94,6 +137,27 @@ class RenderedOutputLine:
     html: str
     entity_count: int
     mode: str = "token"
+
+
+@dataclass(slots=True)
+class CodexRenderedResponse:
+    summary_text: str
+    detail_text: str
+    keyboard: InlineKeyboardMarkup | None = None
+
+
+@dataclass(slots=True)
+class PendingCodexContext:
+    workspace_path: Path
+    run_mode: str = "continue"
+    model_name: str = ""
+    reasoning_effort: str = ""
+    panel: str = "main"
+    awaiting: str | None = None
+    approval_pending: bool = False
+    approval_question: str = ""
+    approval_run_id: str = ""
+    session_allow_approvals: bool = False
 
 
 def resolve_cd_target(raw_target: str, current_dir: Path) -> Path:
@@ -140,6 +204,13 @@ def sanitize_uploaded_filename(file_name: str) -> str:
     if not safe_name or safe_name in {".", ".."}:
         raise ValueError("invalid file name")
     return safe_name
+
+
+def normalize_picker_selection(raw_text: str) -> str:
+    text = raw_text.strip()
+    if text.startswith("✓ "):
+        return text[2:].strip()
+    return text
 
 
 async def save_telegram_file(message: Message, file_id: str, target_path: Path) -> None:
@@ -194,9 +265,121 @@ def persistent_control_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text=BTN_STREAM),
                 KeyboardButton(text=BTN_SHELL),
+                KeyboardButton(text=BTN_CODEX),
                 KeyboardButton(text=BTN_HELP),
             ],
         ],
+        resize_keyboard=True,
+        is_persistent=False,
+    )
+
+
+def codex_control_keyboard(panel: str = "main") -> ReplyKeyboardMarkup:
+    if panel == "run":
+        keyboard = [
+            [
+                KeyboardButton(text=BTN_CODEX_RETRY),
+                KeyboardButton(text=BTN_CODEX_CANCEL),
+            ],
+            [
+                KeyboardButton(text=BTN_CODEX_PATCH),
+                KeyboardButton(text=BTN_CODEX_LOGS),
+            ],
+            [
+                KeyboardButton(text=BTN_BACK),
+            ],
+        ]
+    elif panel == "review":
+        keyboard = [
+            [
+                KeyboardButton(text=BTN_CODEX_INFO),
+            ],
+            [
+                KeyboardButton(text=BTN_CODEX_CHANGES),
+                KeyboardButton(text=BTN_CODEX_FILES),
+            ],
+            [
+                KeyboardButton(text=BTN_CODEX_END),
+                KeyboardButton(text=BTN_BACK),
+            ],
+        ]
+    else:
+        keyboard = [
+            [
+                KeyboardButton(text=BTN_CODEX_DIR),
+                KeyboardButton(text=BTN_CODEX_MODE),
+                KeyboardButton(text=BTN_CODEX_MODEL),
+            ],
+            [
+                KeyboardButton(text=BTN_CODEX_STATUS),
+                KeyboardButton(text=BTN_CODEX_PATCH),
+                KeyboardButton(text=BTN_CODEX_END),
+            ],
+            [
+                KeyboardButton(text=BTN_CODEX_RUN_TOOLS),
+                KeyboardButton(text=BTN_CODEX_REVIEW),
+                KeyboardButton(text=BTN_BACK),
+            ],
+        ]
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        is_persistent=False,
+    )
+
+
+def codex_approval_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=BTN_CODEX_APPROVE),
+                KeyboardButton(text=BTN_CODEX_REJECT),
+            ],
+            [
+                KeyboardButton(text=BTN_CODEX_ALLOW),
+                KeyboardButton(text=BTN_BACK),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=False,
+    )
+
+
+def codex_model_picker_keyboard(models: list[str], current: str | None = None) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = []
+    row: list[KeyboardButton] = []
+    current_norm = (current or "").strip()
+    for model in models:
+        label = f"✓ {model}" if current_norm and model == current_norm else model
+        row.append(KeyboardButton(text=label))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(text=BTN_BACK)])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=False,
+    )
+
+
+def codex_effort_picker_keyboard(efforts: list[str], current: str | None = None) -> ReplyKeyboardMarkup:
+    rows: list[list[KeyboardButton]] = []
+    row: list[KeyboardButton] = []
+    current_norm = (current or "").strip().lower()
+    for effort in efforts:
+        label = f"✓ {effort}" if current_norm and effort.lower() == current_norm else effort
+        row.append(KeyboardButton(text=label))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(text=BTN_BACK)])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
         resize_keyboard=True,
         is_persistent=False,
     )
@@ -292,6 +475,256 @@ def shell_picker_keyboard() -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def codex_result_keyboard(run: CodexRun) -> InlineKeyboardMarkup:
+    parsed = parse_codex_structured_result(run) or {}
+    has_changes = isinstance(parsed.get("what_changed"), list) and bool(parsed.get("what_changed"))
+    has_files = isinstance(parsed.get("changed_files"), list) and bool(parsed.get("changed_files"))
+    has_logs = bool(
+        (run.stderr_artifact_path and run.stderr_artifact_path.exists())
+        or (run.stdout_artifact_path and run.stdout_artifact_path.exists())
+    )
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="Retry",
+                callback_data=f"{CODEX_RESULT_PREFIX}:retry:{run.codex_run_id}",
+            ),
+            InlineKeyboardButton(
+                text="New Session",
+                callback_data=f"{CODEX_RESULT_PREFIX}:new:{run.codex_run_id}",
+            ),
+            InlineKeyboardButton(
+                text="End Session",
+                callback_data=f"{CODEX_RESULT_PREFIX}:end:{run.codex_run_id}",
+            ),
+        ]
+    ]
+
+    row_two: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            text="Session Info",
+            callback_data=f"{CODEX_RESULT_PREFIX}:info:{run.codex_run_id}",
+        ),
+    ]
+    if has_logs:
+        row_two.append(
+            InlineKeyboardButton(
+                text="Show Logs",
+                callback_data=f"{CODEX_RESULT_PREFIX}:logs:{run.codex_run_id}",
+            )
+        )
+    row_two.append(
+        InlineKeyboardButton(
+            text="Export Patch",
+            callback_data=f"{CODEX_RESULT_PREFIX}:patch:{run.codex_run_id}",
+        )
+    )
+    rows.append(row_two)
+
+    row_three: list[InlineKeyboardButton] = []
+    if has_changes:
+        row_three.append(
+            InlineKeyboardButton(
+                text="Show Changes",
+                callback_data=f"{CODEX_RESULT_PREFIX}:changes:{run.codex_run_id}",
+            )
+        )
+    if has_files:
+        row_three.append(
+            InlineKeyboardButton(
+                text="Show Files",
+                callback_data=f"{CODEX_RESULT_PREFIX}:files:{run.codex_run_id}",
+            )
+        )
+    if row_three:
+        rows.append(row_three)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def codex_patch_scope_keyboard(run_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Run Files Only",
+                    callback_data=f"{CODEX_RESULT_PREFIX}:patch_run:{run_id}",
+                ),
+                InlineKeyboardButton(
+                    text="All Repo Changes",
+                    callback_data=f"{CODEX_RESULT_PREFIX}:patch_all:{run_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def parse_codex_result_callback(data: str | None) -> tuple[str, str] | None:
+    if not data:
+        return None
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        return None
+    prefix, action, run_id = parts
+    if prefix != CODEX_RESULT_PREFIX:
+        return None
+    if action not in {
+        "retry",
+        "new",
+        "end",
+        "info",
+        "logs",
+        "changes",
+        "files",
+        "patch",
+        "patch_run",
+        "patch_all",
+    }:
+        return None
+    if not run_id:
+        return None
+    return action, run_id
+
+
+def export_patch_for_run(
+    run: CodexRun,
+    scope: Literal["auto", "run_files", "all_changes"] = "auto",
+) -> tuple[Path | None, str]:
+    workspace = run.workspace_path
+    git_dir = workspace / ".git"
+    if not git_dir.exists():
+        return None, "Patch export is only available inside a Git repository."
+
+    parsed = parse_codex_structured_result(run) or {}
+    changed_files_raw = parsed.get("changed_files")
+    workspace = workspace.resolve()
+    workspace_posix = workspace.as_posix().rstrip("/")
+    workspace_name = workspace.name.strip()
+    changed_paths: list[str] = []
+
+    def normalize_scope_path(raw_path: str) -> str:
+        raw = raw_path.replace("\\", "/").strip()
+        if not raw:
+            return ""
+        candidate_path = Path(raw)
+        if candidate_path.is_absolute():
+            with contextlib.suppress(Exception):
+                raw = candidate_path.resolve(strict=False).relative_to(workspace).as_posix()
+        elif workspace_posix and raw.startswith(workspace_posix + "/"):
+            raw = raw[len(workspace_posix) + 1 :]
+        elif workspace_name and f"/{workspace_name}/" in raw:
+            marker = f"/{workspace_name}/"
+            raw = raw.split(marker, 1)[1]
+        elif workspace_name and raw.startswith(workspace_name + "/"):
+            # Some model outputs include the workspace directory name prefix.
+            raw = raw[len(workspace_name) + 1 :]
+        raw = raw.lstrip("./").strip("/")
+        if not raw or raw.startswith("../") or "/../" in raw:
+            return ""
+        return raw
+
+    if isinstance(changed_files_raw, list):
+        for item in changed_files_raw:
+            if not isinstance(item, dict):
+                continue
+            raw_path = str(item.get("path") or "").strip()
+            if not raw_path:
+                continue
+            normalized = normalize_scope_path(raw_path)
+            if normalized and normalized not in changed_paths:
+                changed_paths.append(normalized)
+
+    def run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-c", "core.quotepath=false", *args],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+    def collect_status_paths() -> list[str]:
+        paths: list[str] = []
+        for args in (
+            ["diff", "--name-only", "--cached"],
+            ["diff", "--name-only"],
+            ["ls-files", "--others", "--exclude-standard"],
+        ):
+            out = run_git(args)
+            for line in out.stdout.splitlines():
+                norm = normalize_scope_path(line)
+                if norm and norm not in paths:
+                    paths.append(norm)
+        return paths
+
+    patch_parts: list[str] = []
+    if scope == "run_files":
+        scoped_paths = changed_paths[:120]
+        if not scoped_paths:
+            return None, "No run-scoped changed files found. Use 'All Repo Changes'."
+    elif scope == "all_changes":
+        scoped_paths = collect_status_paths()[:200]
+    else:
+        scoped_paths = changed_paths[:120]
+        if not scoped_paths:
+            scoped_paths = collect_status_paths()[:200]
+    scope_args = ["--", *scoped_paths] if scoped_paths else []
+
+    staged = run_git(["diff", "--binary", "--cached", *scope_args])
+    if staged.stdout.strip():
+        patch_parts.append(staged.stdout)
+    unstaged = run_git(["diff", "--binary", *scope_args])
+    if unstaged.stdout.strip():
+        patch_parts.append(unstaged.stdout)
+
+    if scoped_paths:
+        untracked = run_git(["ls-files", "--others", "--exclude-standard", "--", *scoped_paths])
+    else:
+        untracked = run_git(["ls-files", "--others", "--exclude-standard"])
+    for rel_path in (line.strip() for line in untracked.stdout.splitlines()):
+        if not rel_path:
+            continue
+        rel_path = normalize_scope_path(rel_path)
+        if not rel_path:
+            continue
+        full_path = workspace / rel_path
+        if not full_path.exists() or not full_path.is_file():
+            continue
+        no_index = subprocess.run(
+            [
+                "git",
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--binary",
+                "--no-index",
+                "/dev/null",
+                rel_path,
+            ],
+            cwd=str(workspace),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if no_index.stdout.strip():
+            patch_parts.append(no_index.stdout)
+
+    patch_text = "\n".join(part.rstrip() for part in patch_parts if part.strip()).strip()
+    if not patch_text:
+        return None, "No patchable changes found for this run."
+
+    run_dir = run.stdout_artifact_path.parent if run.stdout_artifact_path else (workspace / "codex_artifacts")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    patch_path = run_dir / f"{run.codex_run_id}.patch"
+    patch_path.write_text(patch_text + "\n", encoding="utf-8")
+    return patch_path, ""
 
 
 def parse_context_control_callback(data: str | None) -> str | None:
@@ -1100,6 +1533,8 @@ def format_help_message(current_dir: Path) -> str:
         "  مثال: <code>/run ls -la</code>\n"
         "• <code>/run cd &lt;path&gt;</code>: تغییر مسیر کاری شما\n"
         "  مثال: <code>/run cd /home/pooria</code>\n"
+        "• <b>Codex</b> (دکمه شیشه‌ای): اجرای Codex روی مسیر فعلی\n"
+        "  مثال: دکمه <b>Codex</b> → ارسال تسک\n"
         "• <code>/run bash</code> یا <code>/run zsh</code>: ورود به شل تعاملی\n"
         "  کاربرد: اجرای چند دستور پشت‌سرهم در یک سشن\n"
         "  مثال: <code>/run zsh</code> سپس پیام <code>whoami</code>\n"
@@ -1145,6 +1580,8 @@ def format_help_message(current_dir: Path) -> str:
         "  Example: <code>/run df -h</code>\n"
         "• <code>/run cd &lt;path&gt;</code>: change your working directory\n"
         "  Example: <code>/run cd /var/log</code>\n"
+        "• <b>Codex</b> (glass button): run Codex in the current workspace\n"
+        "  Example: tap <b>Codex</b> -> send your task\n"
         "• <code>/run bash</code> or <code>/run zsh</code>: start an interactive shell session\n"
         "  Use case: keep one live shell and send multiple commands\n"
         "  Example: <code>/run bash</code>, then send plain text <code>pwd</code>\n"
@@ -1540,6 +1977,334 @@ async def stream_session_output(
         session_manager.save_session(session)
 
 
+def redact_sensitive_text(text: str) -> str:
+    redacted = re.sub(r"sk-[A-Za-z0-9_-]{12,}", "[REDACTED_API_KEY]", text)
+    redacted = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s]+", r"\1[REDACTED]", redacted)
+    redacted = re.sub(r"(?i)(api[_-]?key\s*[=:]\s*)[^\s]+", r"\1[REDACTED]", redacted)
+    return redacted
+
+
+def parse_codex_structured_result(run: CodexRun) -> dict[str, object] | None:
+    if not run.structured_result_json.strip():
+        return None
+    try:
+        parsed = json.loads(run.structured_result_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def chunk_html_message(text: str, max_chars: int = 3500) -> list[str]:
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        split_at = remaining.rfind("\n\n", 0, max_chars + 1)
+        if split_at < max_chars // 2:
+            split_at = remaining.rfind("\n", 0, max_chars + 1)
+        if split_at < max_chars // 2:
+            split_at = max_chars
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def format_codex_status_text(
+    stage: str,
+    workspace_path: Path,
+    mode: str,
+    model_name: str,
+    reasoning_effort: str,
+    codex_session: CodexSession | None = None,
+) -> str:
+    lines = [
+        "<b>Codex Run</b>",
+        f"<b>Status:</b> <code>{escape(stage)}</code>",
+        f"<b>Workspace:</b> <code>{escape(str(workspace_path))}</code>",
+        f"<b>Mode:</b> <code>{escape(mode)}</code>",
+        f"<b>Model:</b> <code>{escape(model_name or 'default')}</code>",
+        f"<b>Effort:</b> <code>{escape(reasoning_effort or 'default')}</code>",
+    ]
+    if codex_session is not None:
+        lines.append(f"<b>Session:</b> <code>{escape(codex_session.codex_session_id)}</code>")
+    return "\n".join(lines)
+
+
+def format_codex_panel_text(
+    workspace_path: Path,
+    mode: str,
+    model_name: str,
+    reasoning_effort: str,
+    pending_state: str | None = None,
+    codex_session: CodexSession | None = None,
+    shell_session_active: bool = False,
+) -> str:
+    state_label = pending_state or "ready"
+    lines = [
+        "<b>Codex Workspace Panel</b>",
+        f"<b>Workspace:</b> <code>{escape(str(workspace_path))}</code>",
+        f"<b>Mode:</b> <code>{escape(mode)}</code>",
+        f"<b>Model:</b> <code>{escape(model_name or 'default')}</code>",
+        f"<b>Effort:</b> <code>{escape(reasoning_effort or 'default')}</code>",
+        f"<b>Status:</b> <code>{escape(state_label)}</code>",
+    ]
+    if codex_session is not None:
+        lines.append(f"<b>Active session:</b> <code>{escape(codex_session.codex_session_id)}</code>")
+    lines.extend(
+        [
+            "",
+            "• <b>Send your task directly</b> after pressing <b>Codex</b>",
+            f"• <b>{BTN_CODEX_DIR}</b>: send a different directory path",
+            f"• <b>{BTN_CODEX_MODE}</b>: toggle continue/new for the next run",
+            f"• <b>{BTN_CODEX_MODEL}</b>: choose model, then effort",
+            f"• <b>{BTN_CODEX_RUN_TOOLS}</b>: run-time actions (retry/cancel/patch/logs)",
+            f"• <b>{BTN_CODEX_REVIEW}</b>: inspect session and result artifacts",
+            f"• <b>{BTN_CODEX_STATUS}</b>: show live run status",
+        ]
+    )
+    if shell_session_active:
+        lines.extend(
+            [
+                "",
+                "<b>Note:</b> if you changed directories inside an interactive shell,",
+                f"use <b>{BTN_CODEX_DIR}</b> to point Codex at that exact path.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def format_codex_profile_card(
+    workspace_path: Path,
+    mode: str,
+    model_name: str,
+    reasoning_effort: str,
+    state_label: str = "ready",
+) -> str:
+    return "\n".join(
+        [
+            "<b>Codex Profile</b>",
+            f"<b>Workspace:</b> <code>{escape(str(workspace_path))}</code>",
+            f"<b>Mode:</b> <code>{escape(mode)}</code>",
+            f"<b>Model:</b> <code>{escape(model_name or 'default')}</code>",
+            f"<b>Effort:</b> <code>{escape(reasoning_effort or 'default')}</code>",
+            f"<b>Status:</b> <code>{escape(state_label)}</code>",
+        ]
+    )
+
+
+def format_codex_session_info(session: CodexSession, run: CodexRun | None) -> str:
+    lines = [
+        "<b>Codex Session</b>",
+        f"<b>Session:</b> <code>{escape(session.codex_session_id)}</code>",
+        f"<b>State:</b> <code>{escape(session.state)}</code>",
+        f"<b>Mode:</b> <code>{escape(session.default_mode)}</code>",
+        f"<b>Model:</b> <code>{escape(session.default_model or 'default')}</code>",
+        f"<b>Effort:</b> <code>{escape(session.default_reasoning_effort or 'default')}</code>",
+        f"<b>Workspace:</b> <code>{escape(str(session.workspace_path))}</code>",
+        f"<b>Updated:</b> <code>{escape(format_local_timestamp(session.updated_at))}</code>",
+    ]
+    if run is not None:
+        lines.append(f"<b>Last run:</b> <code>{escape(run.codex_run_id)}</code>")
+        lines.append(f"<b>Last status:</b> <code>{escape(run.status)}</code>")
+        if run.model_name.strip():
+            lines.append(f"<b>Last model:</b> <code>{escape(run.model_name)}</code>")
+        if run.reasoning_effort.strip():
+            lines.append(f"<b>Last effort:</b> <code>{escape(run.reasoning_effort)}</code>")
+    return "\n".join(lines)
+
+
+def format_codex_changed_files(run: CodexRun) -> str:
+    parsed = parse_codex_structured_result(run)
+    if not parsed:
+        return ""
+    changed_files = parsed.get("changed_files")
+    if not isinstance(changed_files, list) or not changed_files:
+        return ""
+    lines = ["<b>Changed Files</b>"]
+    for item in changed_files:
+        if not isinstance(item, dict):
+            continue
+        path = escape(str(item.get("path") or "unknown"))
+        change_type = escape(str(item.get("change_type") or "modified"))
+        summary = escape(str(item.get("summary") or ""))
+        lines.append(f"• <code>{path}</code> <b>({change_type})</b>")
+        if summary:
+            lines.append(summary)
+    return "\n".join(lines)
+
+
+def format_codex_changes_summary(run: CodexRun) -> str:
+    parsed = parse_codex_structured_result(run)
+    if not parsed:
+        return ""
+    items = parsed.get("what_changed")
+    if not isinstance(items, list) or not items:
+        return ""
+    ignored = {
+        "no change summary available",
+        "no changes",
+        "no changed files reported",
+    }
+    lines = ["<b>What Changed</b>"]
+    for item in items:
+        text = str(item).strip()
+        if not text:
+            continue
+        if text.lower() in ignored:
+            continue
+        lines.append(f"• {escape(text)}")
+    if len(lines) == 1:
+        return ""
+    return "\n".join(lines)
+
+
+def format_codex_logs(run: CodexRun) -> str:
+    stderr_text = ""
+    stdout_text = ""
+    if run.stderr_artifact_path and run.stderr_artifact_path.exists():
+        stderr_text = run.stderr_artifact_path.read_text(encoding="utf-8", errors="replace").strip()
+    if run.stdout_artifact_path and run.stdout_artifact_path.exists():
+        stdout_text = run.stdout_artifact_path.read_text(encoding="utf-8", errors="replace").strip()
+    body = stderr_text or stdout_text or "[no logs]"
+    body = redact_sensitive_text(body)
+    body_lines = body.splitlines()[:80]
+    rendered = render_output_lines("\n".join(body_lines))
+    return (
+        "<b>Codex Logs</b>\n"
+        f"<b>Run:</b> <code>{escape(run.codex_run_id)}</code>\n"
+        f"<b>Status:</b> <code>{escape(run.status)}</code>\n"
+        f"{rendered}"
+    )
+
+
+def render_codex_response(session: CodexSession, run: CodexRun) -> CodexRenderedResponse:
+    parsed = parse_codex_structured_result(run)
+    status = run.status
+    failed = status == "failed"
+    status_label = {
+        "success": "Success",
+        "partial": "Partial",
+        "failed": "Failed",
+        "queued": "Queued",
+        "running": "Running",
+        "cancelled": "Cancelled",
+    }.get(status, status)
+    summary_lines = [
+        "<b>Codex Result</b>",
+        f"<b>Status:</b> <code>{escape(status_label)}</code>",
+        f"<b>Workspace:</b> <code>{escape(str(run.workspace_path))}</code>",
+        f"<b>Model:</b> <code>{escape(run.model_name or session.default_model or 'default')}</code>",
+        f"<b>Effort:</b> <code>{escape(run.reasoning_effort or session.default_reasoning_effort or 'default')}</code>",
+    ]
+    detail_lines: list[str] = []
+    if parsed:
+        summary_short = str(parsed.get("summary_short") or "").strip()
+        result_for_user = str(parsed.get("result_for_user") or "").strip()
+        if summary_short:
+            summary_lines.append(escape(summary_short))
+        if result_for_user:
+            summary_lines.append("")
+            summary_lines.append(escape(result_for_user))
+        changed = parsed.get("what_changed")
+        ignored_changed = {
+            "no change summary available",
+            "no changes",
+            "no changed files reported",
+        }
+        if isinstance(changed, list) and changed:
+            rendered_changed: list[str] = []
+            for item in changed[:8]:
+                text = str(item).strip()
+                if not text:
+                    continue
+                if text.lower() in ignored_changed:
+                    continue
+                rendered_changed.append(text)
+            if rendered_changed:
+                summary_lines.append("")
+                summary_lines.append("<b>What changed</b>")
+                for item in rendered_changed[:5]:
+                    summary_lines.append(f"• {escape(item)}")
+        checks = parsed.get("checks")
+        if isinstance(checks, list) and checks:
+            rendered_checks: list[str] = []
+            passed_count = 0
+            failed_count = 0
+            skipped_count = 0
+            for item in checks[:10]:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "check").strip()
+                check_status_raw = str(item.get("status") or "unknown").strip().lower()
+                details = str(item.get("details") or "").strip()
+                if check_status_raw == "passed":
+                    passed_count += 1
+                elif check_status_raw == "failed":
+                    failed_count += 1
+                elif check_status_raw == "skipped":
+                    skipped_count += 1
+                check_status = {
+                    "passed": "passed",
+                    "failed": "failed",
+                    "skipped": "skipped",
+                }.get(check_status_raw, check_status_raw or "unknown")
+                details_part = f" {escape(details)}" if details else ""
+                rendered_checks.append(
+                    f"• <code>{escape(name)}</code>: <code>{escape(check_status)}</code>{details_part}"
+                )
+            if rendered_checks:
+                summary_lines.append("")
+                summary_lines.append("<b>Checks</b>")
+                summary_lines.append(
+                    f"Passed: <code>{passed_count}</code> | "
+                    f"Failed: <code>{failed_count}</code> | "
+                    f"Skipped: <code>{skipped_count}</code>"
+                )
+                summary_lines.extend(rendered_checks[:5])
+        next_steps = parsed.get("next_steps")
+        if isinstance(next_steps, list) and next_steps:
+            rendered_steps: list[str] = []
+            for item in next_steps[:6]:
+                text = str(item).strip()
+                if not text:
+                    continue
+                rendered_steps.append(text)
+            if rendered_steps:
+                summary_lines.append("")
+                summary_lines.append("<b>Next steps</b>")
+                for item in rendered_steps[:3]:
+                    summary_lines.append(f"• {escape(item)}")
+    else:
+        fallback_text = run.summary_short or run.failure_summary or "Codex finished without structured result."
+        summary_lines.append(escape(fallback_text[:700]))
+        if failed and run.failure_summary:
+            summary_lines.append("")
+            summary_lines.append("<b>Failure</b>")
+            summary_lines.append(escape(run.failure_summary[:900]))
+    if failed:
+        detail_lines.append("")
+        detail_lines.append(f"<b>Use the {BTN_CODEX_LOGS} button to inspect failure details.</b>")
+    return CodexRenderedResponse(
+        summary_text="\n".join(summary_lines),
+        detail_text="\n".join(item for item in detail_lines if item).strip(),
+        keyboard=codex_result_keyboard(run),
+    )
+
+
+async def safe_edit_message_text(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    with contextlib.suppress(TelegramBadRequest):
+        await message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+
+
 async def wait_session_exit(
     session: Session,
     session_manager: SessionManager,
@@ -1616,9 +2381,19 @@ async def wait_session_exit(
             await bot.send_message(session.chat_id, chunk, parse_mode="HTML")
 
 
-def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dispatcher:
+def build_dispatcher(
+    settings: Settings,
+    session_manager: SessionManager,
+    codex_runner: CodexRunner | None = None,
+) -> Dispatcher:
     dp = Dispatcher()
+    if codex_runner is None:
+        raise RuntimeError("CodexRunner is required")
     pending_kill_by_user: dict[int, PendingKill] = {}
+    pending_codex_by_chat_user: dict[tuple[int, int], PendingCodexContext] = {}
+
+    def codex_context_key(user_id: int, chat_id: int) -> tuple[int, int]:
+        return chat_id, user_id
 
     def parse_optional_session_id(text: str) -> str | None:
         parts = text.strip().split(maxsplit=1)
@@ -1626,6 +2401,505 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
             return None
         candidate = parts[1].strip()
         return candidate or None
+
+    async def send_html_chunks(
+        message: Message,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        chunks = chunk_html_message(text)
+        for index, chunk in enumerate(chunks):
+            await message.answer(
+                chunk,
+                parse_mode="HTML",
+                reply_markup=reply_markup if index == 0 else None,
+            )
+
+    async def send_patch_export(
+        message: Message,
+        run: CodexRun,
+        scope_key: Literal["run_files", "all_changes"],
+    ) -> bool:
+        scope_label = "Run Files Only" if scope_key == "run_files" else "All Repo Changes"
+        patch_path, error_message = export_patch_for_run(run, scope=scope_key)
+        if patch_path is None:
+            await message.answer(
+                f"<b>Patch export failed.</b>\n{escape(error_message or 'Unknown error.')}",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            return False
+        await message.answer_document(
+            document=FSInputFile(str(patch_path)),
+            caption=(
+                "<b>Patch exported</b>\n"
+                f"<b>Scope:</b> <code>{escape(scope_label)}</code>\n"
+                f"<b>Run:</b> <code>{escape(run.codex_run_id)}</code>\n"
+                f"<b>Workspace:</b> <code>{escape(str(run.workspace_path))}</code>"
+            ),
+            parse_mode="HTML",
+        )
+        await message.answer(
+            "<b>Apply this patch from your repo root:</b>\n"
+            f"1. <code>git apply --check {escape(patch_path.name)}</code>\n"
+            f"2. <code>git apply {escape(patch_path.name)}</code>\n"
+            "3. <code>git status</code>\n"
+            "4. <code>git diff --stat</code>",
+            parse_mode="HTML",
+            reply_markup=codex_control_keyboard(),
+        )
+        return True
+
+    def get_or_create_pending_codex_context(user_id: int, chat_id: int) -> PendingCodexContext:
+        key = codex_context_key(user_id, chat_id)
+        existing = pending_codex_by_chat_user.get(key)
+        if existing is not None:
+            return existing
+        active_session = session_manager.get_active_codex_session_for_chat(chat_id)
+
+        workspace = session_manager.get_current_workdir(user_id)
+        shell_session = session_manager.get_active_session_for_user(user_id)
+        if (
+            shell_session is not None
+            and is_shell_session_command(shell_session.command)
+            and shell_session.process is not None
+            and shell_session.process.returncode is None
+        ):
+            with contextlib.suppress(OSError, RuntimeError):
+                live_cwd = Path(f"/proc/{shell_session.process.pid}/cwd").resolve(strict=True)
+                if live_cwd.is_dir():
+                    workspace = live_cwd
+                    session_manager.set_current_workdir(user_id, live_cwd)
+
+        context = PendingCodexContext(
+            workspace_path=workspace,
+            run_mode=active_session.default_mode if active_session is not None else "continue",
+            model_name=(active_session.default_model if active_session is not None else settings.codex_model),
+            reasoning_effort=(
+                active_session.default_reasoning_effort
+                if active_session is not None
+                else settings.codex_reasoning_effort
+            ),
+            panel="main",
+        )
+        pending_codex_by_chat_user[key] = context
+        return context
+
+    def reset_pending_codex_context(user_id: int, chat_id: int) -> None:
+        pending_codex_by_chat_user.pop(codex_context_key(user_id, chat_id), None)
+
+    def get_latest_codex_run_for_chat(chat_id: int) -> CodexRun | None:
+        candidates: list[CodexRun] = []
+        active_session = session_manager.get_active_codex_session_for_chat(chat_id)
+        if active_session is not None:
+            active_last = session_manager.get_last_codex_run_for_session(active_session.codex_session_id)
+            if active_last is not None:
+                candidates.append(active_last)
+        for codex_session in session_manager.list_codex_sessions_for_chat(chat_id, limit=50):
+            run = session_manager.get_last_codex_run_for_session(codex_session.codex_session_id)
+            if run is not None:
+                candidates.append(run)
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item.started_at, item.codex_run_id), reverse=True)
+        return candidates[0]
+
+    async def show_codex_panel(message: Message, user_id: int, activate_task_input: bool = False) -> None:
+        active_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+        shell_session = session_manager.get_active_session_for_user(user_id)
+        workspace = session_manager.get_current_workdir(user_id)
+        if (
+            shell_session is not None
+            and is_shell_session_command(shell_session.command)
+            and shell_session.process is not None
+            and shell_session.process.returncode is None
+        ):
+            with contextlib.suppress(OSError, RuntimeError):
+                live_cwd = Path(f"/proc/{shell_session.process.pid}/cwd").resolve(strict=True)
+                if live_cwd.is_dir():
+                    workspace = live_cwd
+                    session_manager.set_current_workdir(user_id, live_cwd)
+        key = codex_context_key(user_id, message.chat.id)
+        context = pending_codex_by_chat_user.get(key)
+        if context is None:
+            context = PendingCodexContext(
+                workspace_path=workspace,
+                run_mode=active_session.default_mode if active_session is not None else "continue",
+                model_name=(active_session.default_model if active_session is not None else settings.codex_model),
+                reasoning_effort=(
+                    active_session.default_reasoning_effort
+                    if active_session is not None
+                    else settings.codex_reasoning_effort
+                ),
+                panel="main",
+                awaiting=None,
+            )
+        else:
+            context.workspace_path = workspace
+            if active_session is not None:
+                context.model_name = active_session.default_model or settings.codex_model
+                context.reasoning_effort = (
+                    active_session.default_reasoning_effort or settings.codex_reasoning_effort
+                )
+        if activate_task_input:
+            context.awaiting = "task"
+        pending_codex_by_chat_user[key] = context
+        await message.answer(
+            format_codex_panel_text(
+                context.workspace_path,
+                context.run_mode,
+                context.model_name,
+                context.reasoning_effort,
+                pending_state=context.awaiting,
+                codex_session=active_session,
+                shell_session_active=shell_session is not None,
+            ),
+            parse_mode="HTML",
+            reply_markup=codex_control_keyboard(context.panel),
+        )
+
+    async def handle_pending_codex_workspace_input(message: Message, user_id: int, raw_text: str) -> bool:
+        pending_codex = pending_codex_by_chat_user.get(codex_context_key(user_id, message.chat.id))
+        if pending_codex is None or pending_codex.awaiting != "workspace":
+            return False
+
+        candidate = resolve_user_path(raw_text, pending_codex.workspace_path)
+        if not candidate.exists():
+            await message.answer(
+                f"<b>Directory not found</b>\n"
+                f"<b>Path:</b> <code>{escape(str(candidate))}</code>",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            return True
+        if not candidate.is_dir():
+            await message.answer(
+                f"<b>Not a directory</b>\n"
+                f"<b>Path:</b> <code>{escape(str(candidate))}</code>",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            return True
+
+        pending_codex.workspace_path = candidate.resolve()
+        pending_codex.awaiting = None
+        await message.answer(
+            "<b>Workspace updated.</b>\n"
+            + format_codex_profile_card(
+                pending_codex.workspace_path,
+                pending_codex.run_mode,
+                pending_codex.model_name or settings.codex_model,
+                pending_codex.reasoning_effort or settings.codex_reasoning_effort,
+                state_label="task",
+            ),
+            parse_mode="HTML",
+            reply_markup=codex_control_keyboard(),
+        )
+        return True
+
+    async def handle_pending_codex_picker_input(message: Message, user_id: int, raw_text: str) -> bool:
+        pending_codex = pending_codex_by_chat_user.get(codex_context_key(user_id, message.chat.id))
+        if pending_codex is None:
+            return False
+        selected = normalize_picker_selection(raw_text)
+        if pending_codex.awaiting == "model_pick":
+            models = [m for m in settings.codex_available_models if m.strip()]
+            if selected == BTN_BACK:
+                pending_codex.awaiting = "task"
+                await message.answer(
+                    "<b>Model selection cancelled.</b>\n"
+                    + format_codex_profile_card(
+                        pending_codex.workspace_path,
+                        pending_codex.run_mode,
+                        pending_codex.model_name or settings.codex_model,
+                        pending_codex.reasoning_effort or settings.codex_reasoning_effort,
+                        state_label="task",
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(pending_codex.panel),
+                )
+                return True
+            if selected not in models:
+                await message.answer(
+                    "<b>Invalid model selection.</b>\nChoose one of the listed model buttons.",
+                    parse_mode="HTML",
+                    reply_markup=codex_model_picker_keyboard(
+                        models,
+                        current=pending_codex.model_name or settings.codex_model,
+                    ),
+                )
+                return True
+            pending_codex.model_name = selected
+            pending_codex.awaiting = "effort_pick"
+            active_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+            if active_session is not None:
+                active_session.default_model = selected
+                session_manager.save_codex_session(active_session)
+            efforts = [e.strip().lower() for e in settings.codex_available_reasoning_efforts if e.strip()]
+            if not efforts:
+                efforts = [settings.codex_reasoning_effort] if settings.codex_reasoning_effort else []
+            await message.answer(
+                "<b>Model selected.</b>\n"
+                f"<b>Model:</b> <code>{escape(selected)}</code>\n"
+                "<b>Now choose reasoning effort.</b>",
+                parse_mode="HTML",
+                reply_markup=codex_effort_picker_keyboard(
+                    efforts,
+                    current=pending_codex.reasoning_effort or settings.codex_reasoning_effort,
+                ),
+            )
+            return True
+        if pending_codex.awaiting == "effort_pick":
+            efforts = [e.strip().lower() for e in settings.codex_available_reasoning_efforts if e.strip()]
+            if selected == BTN_BACK:
+                pending_codex.awaiting = "task"
+                await message.answer(
+                    "<b>Effort selection cancelled.</b>\n"
+                    + format_codex_profile_card(
+                        pending_codex.workspace_path,
+                        pending_codex.run_mode,
+                        pending_codex.model_name or settings.codex_model,
+                        pending_codex.reasoning_effort or settings.codex_reasoning_effort,
+                        state_label="task",
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(pending_codex.panel),
+                )
+                return True
+            selected_effort = selected.lower()
+            if selected_effort not in efforts:
+                await message.answer(
+                    "<b>Invalid effort selection.</b>\nChoose one of the listed effort buttons.",
+                    parse_mode="HTML",
+                    reply_markup=codex_effort_picker_keyboard(
+                        efforts,
+                        current=pending_codex.reasoning_effort or settings.codex_reasoning_effort,
+                    ),
+                )
+                return True
+            pending_codex.reasoning_effort = selected_effort
+            pending_codex.awaiting = "task"
+            active_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+            if active_session is not None:
+                active_session.default_reasoning_effort = selected_effort
+                session_manager.save_codex_session(active_session)
+            await message.answer(
+                "<b>Codex effort updated.</b>\n"
+                + format_codex_profile_card(
+                    pending_codex.workspace_path,
+                    pending_codex.run_mode,
+                    pending_codex.model_name or settings.codex_model,
+                    selected_effort,
+                    state_label="task",
+                ),
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(pending_codex.panel),
+            )
+            return True
+        return False
+
+    async def render_codex_run_result(message: Message, run: CodexRun) -> None:
+        session = session_manager.get_codex_session(run.codex_session_id)
+        if session is None:
+            await send_html_chunks(
+                message,
+                "<b>Codex result is available, but the session record is missing.</b>",
+            )
+            return
+        rendered = render_codex_response(session, run)
+        await send_html_chunks(message, rendered.summary_text, reply_markup=rendered.keyboard)
+        if rendered.detail_text:
+            await send_html_chunks(message, rendered.detail_text)
+
+    async def do_codex_prompt(
+        message: Message,
+        user_id: int,
+        prompt_text: str,
+        run_mode: str | None = None,
+        model_name: str | None = None,
+        reasoning_effort: str | None = None,
+        workspace_path: Path | None = None,
+    ) -> None:
+        prompt = prompt_text.strip()
+        if not prompt:
+            await message.answer(
+                "Send a task text after pressing Codex.",
+                reply_markup=context_control_keyboard("help", "status"),
+            )
+            return
+        context = get_or_create_pending_codex_context(user_id, message.chat.id)
+        if context.session_allow_approvals:
+            prompt = (
+                prompt
+                + "\n\nOperator note: session-level approval mode is enabled. "
+                + "If a privileged step is needed, proceed when safe and report what was done."
+            )
+        active_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+        fallback_workspace = session_manager.get_current_workdir(user_id)
+        shell_session = session_manager.get_active_session_for_user(user_id)
+        if (
+            workspace_path is None
+            and shell_session is not None
+            and is_shell_session_command(shell_session.command)
+            and shell_session.process is not None
+            and shell_session.process.returncode is None
+        ):
+            with contextlib.suppress(OSError, RuntimeError):
+                live_cwd = Path(f"/proc/{shell_session.process.pid}/cwd").resolve(strict=True)
+                if live_cwd.is_dir():
+                    fallback_workspace = live_cwd
+                    session_manager.set_current_workdir(user_id, live_cwd)
+        current_dir = (
+            workspace_path
+            or (active_session.workspace_path if active_session is not None else None)
+            or fallback_workspace
+        ).resolve()
+        resolved_mode = run_mode or (active_session.default_mode if active_session else "continue")
+        resolved_model = (
+            (model_name or "").strip()
+            or (active_session.default_model.strip() if active_session is not None else "")
+            or settings.codex_model
+        )
+        resolved_effort = (
+            (reasoning_effort or "").strip().lower()
+            or (
+                active_session.default_reasoning_effort.strip().lower()
+                if active_session is not None
+                else ""
+            )
+            or settings.codex_reasoning_effort
+        )
+        status_message = await message.answer(
+            format_codex_status_text(
+                "Queued",
+                current_dir,
+                resolved_mode,
+                resolved_model,
+                resolved_effort,
+                codex_session=active_session,
+            ),
+            parse_mode="HTML",
+        )
+        typing_stop = asyncio.Event()
+
+        async def typing_indicator() -> None:
+            while not typing_stop.is_set():
+                with contextlib.suppress(Exception):
+                    await message.bot.send_chat_action(message.chat.id, action="typing")
+                try:
+                    await asyncio.wait_for(typing_stop.wait(), timeout=4.0)
+                except asyncio.TimeoutError:
+                    continue
+
+        typing_task = asyncio.create_task(typing_indicator())
+
+        async def on_status(stage: str) -> None:
+            fresh_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+            await safe_edit_message_text(
+                status_message,
+                format_codex_status_text(
+                    stage,
+                    current_dir,
+                    resolved_mode,
+                    resolved_model,
+                    resolved_effort,
+                    codex_session=fresh_session,
+                ),
+            )
+
+        try:
+            result = await codex_runner.run_prompt(
+                telegram_chat_id=message.chat.id,
+                telegram_user_id=user_id,
+                prompt_text=prompt,
+                run_mode=resolved_mode,  # type: ignore[arg-type]
+                model_override=resolved_model,
+                reasoning_effort_override=resolved_effort,
+                explicit_workspace=current_dir,
+                status_callback=on_status,
+            )
+        except CodexRunConflictError as exc:
+            active_chat_run = session_manager.get_active_codex_run_for_chat(message.chat.id)
+            conflict_lines = [
+                "<b>Codex run blocked</b>",
+                "<b>Reason:</b> another run is already in progress.",
+            ]
+            if active_chat_run is not None:
+                conflict_lines.extend(
+                    [
+                        f"<b>Run:</b> <code>{escape(active_chat_run.codex_run_id)}</code>",
+                        f"<b>Status:</b> <code>{escape(active_chat_run.status)}</code>",
+                        f"<b>Workspace:</b> <code>{escape(str(active_chat_run.workspace_path))}</code>",
+                    ]
+                )
+            conflict_lines.append(f"<b>Details:</b> <code>{escape(str(exc))}</code>")
+            conflict_lines.append(f"Use <b>{BTN_CODEX_STATUS}</b> or <b>{BTN_CODEX_CANCEL}</b>.")
+            await safe_edit_message_text(
+                status_message,
+                "\n".join(conflict_lines),
+            )
+            return
+        except asyncio.TimeoutError:
+            await safe_edit_message_text(
+                status_message,
+                "<b>Codex run failed</b>\n"
+                "<b>Reason:</b> <code>timed out</code>",
+            )
+            return
+        except Exception as exc:
+            logger.exception("Codex run failed: chat_id=%s user_id=%s", message.chat.id, user_id)
+            await safe_edit_message_text(
+                status_message,
+                "<b>Codex run failed</b>\n"
+                f"<b>Error:</b> <code>{escape(str(exc))}</code>",
+            )
+            return
+        finally:
+            typing_stop.set()
+            typing_task.cancel()
+            with contextlib.suppress(Exception):
+                await typing_task
+
+        terminal_state = "Completed" if result.run.status != "failed" else "Failed"
+        await safe_edit_message_text(
+            status_message,
+            format_codex_status_text(
+                terminal_state,
+                result.run.workspace_path,
+                result.run.run_mode,
+                resolved_model,
+                resolved_effort,
+                codex_session=session_manager.get_codex_session(result.run.codex_session_id),
+            ),
+        )
+        pending_codex_by_chat_user[codex_context_key(user_id, message.chat.id)] = PendingCodexContext(
+            workspace_path=result.run.workspace_path,
+            run_mode=result.run.run_mode,
+            model_name=resolved_model,
+            reasoning_effort=resolved_effort,
+            awaiting=None,
+        )
+        await render_codex_run_result(message, result.run)
+        parsed_result = parse_codex_structured_result(result.run) or {}
+        needs_user_input = bool(parsed_result.get("needs_user_input"))
+        user_input_question = str(parsed_result.get("user_input_question") or "").strip()
+        if needs_user_input:
+            pending_context = get_or_create_pending_codex_context(user_id, message.chat.id)
+            pending_context.awaiting = "approval"
+            pending_context.approval_pending = True
+            pending_context.approval_question = user_input_question
+            pending_context.approval_run_id = result.run.codex_run_id
+            if user_input_question:
+                question_line = f"\n<b>Request:</b> {escape(user_input_question)}"
+            else:
+                question_line = ""
+            await message.answer(
+                "<b>Codex needs approval to continue.</b>"
+                f"{question_line}\n"
+                "Use approval buttons below.",
+                parse_mode="HTML",
+                reply_markup=codex_approval_keyboard(),
+            )
 
     async def do_start_shell(message: Message, user_id: int, shell_name: str) -> None:
         shell_name = shell_name.strip().lower()
@@ -2217,6 +3491,28 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
 
         await do_help(message, user.id)
 
+    @dp.message(Command("codex"))
+    async def codex_handler(message: Message) -> None:
+        user = message.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+
+        text = (message.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await show_codex_panel(message, user.id)
+            return
+        context = get_or_create_pending_codex_context(user.id, message.chat.id)
+        await do_codex_prompt(
+            message,
+            user.id,
+            parts[1].strip(),
+            run_mode=context.run_mode,
+            model_name=context.model_name,
+            reasoning_effort=context.reasoning_effort,
+            workspace_path=context.workspace_path,
+        )
+
     @dp.message(Command("status"))
     async def status_handler(message: Message) -> None:
         user = message.from_user
@@ -2729,6 +4025,125 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         await do_start_shell(callback.message, user.id, shell_name)
         await callback.answer(f"{shell_name} requested.", show_alert=False)
 
+    @dp.callback_query(F.data.startswith(f"{CODEX_RESULT_PREFIX}:"))
+    async def codex_result_handler(callback: CallbackQuery) -> None:
+        user = callback.from_user
+        if not user or not is_allowed(user.id, settings):
+            return
+        parsed = parse_codex_result_callback(callback.data)
+        if not parsed:
+            await callback.answer("Invalid action.", show_alert=False)
+            return
+        if not callback.message:
+            await callback.answer("No message context.", show_alert=False)
+            return
+
+        action, run_id = parsed
+        run = session_manager.get_codex_run(run_id)
+        if run is None or run.telegram_chat_id != callback.message.chat.id:
+            await callback.answer("Run not found.", show_alert=False)
+            return
+
+        if action == "retry":
+            await callback.answer("Retrying...", show_alert=False)
+            await do_codex_prompt(
+                callback.message,
+                user.id,
+                run.prompt_text,
+                run_mode=run.run_mode,
+                model_name=(run.model_name or settings.codex_model),
+                reasoning_effort=(run.reasoning_effort or settings.codex_reasoning_effort),
+                workspace_path=run.workspace_path,
+            )
+            return
+        if action == "new":
+            active_session = session_manager.get_active_codex_session_for_chat(callback.message.chat.id)
+            if active_session is not None:
+                session_manager.close_codex_session(active_session.codex_session_id)
+            context = get_or_create_pending_codex_context(user.id, callback.message.chat.id)
+            context.run_mode = "new"
+            context.workspace_path = run.workspace_path
+            context.model_name = run.model_name or context.model_name or settings.codex_model
+            context.reasoning_effort = (
+                run.reasoning_effort
+                or context.reasoning_effort
+                or settings.codex_reasoning_effort
+            )
+            context.awaiting = "task"
+            await callback.message.answer(
+                "<b>New Codex session mode enabled.</b>\n"
+                f"<b>Workspace:</b> <code>{escape(str(run.workspace_path))}</code>\n"
+                f"<b>Model:</b> <code>{escape(context.model_name or settings.codex_model or 'default')}</code>\n"
+                f"<b>Effort:</b> <code>{escape(context.reasoning_effort or settings.codex_reasoning_effort or 'default')}</code>\n"
+                "Send your next task.",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            await callback.answer("New session ready.", show_alert=False)
+            return
+        if action == "end":
+            active_session = session_manager.get_active_codex_session_for_chat(callback.message.chat.id)
+            if active_session is not None:
+                session_manager.close_codex_session(active_session.codex_session_id)
+            reset_pending_codex_context(user.id, callback.message.chat.id)
+            await callback.message.answer(
+                "<b>Codex session ended.</b>",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            await callback.answer("Session ended.", show_alert=False)
+            return
+        if action == "info":
+            session = session_manager.get_codex_session(run.codex_session_id)
+            if session is None:
+                await callback.answer("Session not found.", show_alert=False)
+                return
+            last_run = session_manager.get_last_codex_run_for_session(session.codex_session_id)
+            await send_html_chunks(callback.message, format_codex_session_info(session, last_run))
+            await callback.answer("Session info sent.", show_alert=False)
+            return
+        if action == "logs":
+            await send_html_chunks(callback.message, format_codex_logs(run))
+            await callback.answer("Logs sent.", show_alert=False)
+            return
+        if action == "patch":
+            await callback.message.answer(
+                "<b>Select patch scope</b>\nChoose how broad the exported patch should be.",
+                parse_mode="HTML",
+                reply_markup=codex_patch_scope_keyboard(run.codex_run_id),
+            )
+            await callback.answer("Choose patch scope.", show_alert=False)
+            return
+        if action == "patch_run":
+            ok = await send_patch_export(callback.message, run, scope_key="run_files")
+            await callback.answer(
+                "Run files patch exported." if ok else "Patch export failed.",
+                show_alert=False,
+            )
+            return
+        if action == "patch_all":
+            ok = await send_patch_export(callback.message, run, scope_key="all_changes")
+            await callback.answer(
+                "All changes patch exported." if ok else "Patch export failed.",
+                show_alert=False,
+            )
+            return
+        if action == "changes":
+            changes_text = format_codex_changes_summary(run)
+            if not changes_text:
+                await callback.answer("No change summary.", show_alert=False)
+                return
+            await send_html_chunks(callback.message, changes_text)
+            await callback.answer("Changes sent.", show_alert=False)
+            return
+
+        files_text = format_codex_changed_files(run)
+        if not files_text:
+            await callback.answer("No changed files.", show_alert=False)
+            return
+        await send_html_chunks(callback.message, files_text)
+        await callback.answer("Files sent.", show_alert=False)
+
     @dp.callback_query(F.data.startswith(f"{SESSION_LIST_PREFIX}:"))
     async def session_list_control_handler(callback: CallbackQuery) -> None:
         user = callback.from_user
@@ -2915,6 +4330,338 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 parse_mode="HTML",
                 reply_markup=shell_picker_keyboard(),
             )
+            return
+        if action == "codex_panel":
+            await show_codex_panel(message, user.id, activate_task_input=True)
+            return
+        if action == "codex_mode":
+            context = get_or_create_pending_codex_context(user.id, message.chat.id)
+            context.run_mode = "new" if context.run_mode == "continue" else "continue"
+            active_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+            if active_session is not None:
+                active_session.default_mode = context.run_mode
+                session_manager.save_codex_session(active_session)
+            await message.answer(
+                "<b>Codex mode updated.</b>\n"
+                + format_codex_profile_card(
+                    context.workspace_path,
+                    context.run_mode,
+                    context.model_name or settings.codex_model,
+                    context.reasoning_effort or settings.codex_reasoning_effort,
+                    state_label="task",
+                ),
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            return
+        if action == "codex_model":
+            context = get_or_create_pending_codex_context(user.id, message.chat.id)
+            context.panel = "main"
+            models = [m for m in settings.codex_available_models if m.strip()]
+            if not models:
+                models = [settings.codex_model] if settings.codex_model else []
+            if not models:
+                await message.answer(
+                    "<b>No configured Codex models.</b>\nSet <code>CODEX_AVAILABLE_MODELS</code> in env.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(context.panel),
+                )
+                return
+            current_model = context.model_name.strip() or settings.codex_model.strip() or models[0]
+            await message.answer(
+                "<b>Select Codex model</b>\n"
+                f"<b>Current:</b> <code>{escape(current_model)}</code>\n"
+                "Choose one model from the keyboard. Next step is effort selection.",
+                parse_mode="HTML",
+                reply_markup=codex_model_picker_keyboard(models, current=current_model),
+            )
+            context.awaiting = "model_pick"
+            return
+        if action in {"codex_run_tools", "codex_settings"}:
+            context = get_or_create_pending_codex_context(user.id, message.chat.id)
+            context.panel = "run"
+            await message.answer(
+                "<b>Run Tools</b>\nUse these actions while a run is active or for patch/log export.",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(context.panel),
+            )
+            return
+        if action == "codex_review":
+            context = get_or_create_pending_codex_context(user.id, message.chat.id)
+            context.panel = "review"
+            await message.answer(
+                "<b>Review</b>\nUse these actions for session info and result inspection.",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(context.panel),
+            )
+            return
+        if action == "codex_dir":
+            context = get_or_create_pending_codex_context(user.id, message.chat.id)
+            context.awaiting = "workspace"
+            await message.answer(
+                f"<b>{BTN_CODEX_DIR} selected.</b>\nSend the directory path now (example: <code>/tmp/test</code>).",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(context.panel),
+            )
+            return
+        if action == "codex_info":
+            session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+            if session is None:
+                await message.answer(
+                    "<b>No active Codex session.</b>\nPress <b>Codex</b> and send your task.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            last_run = session_manager.get_last_codex_run_for_session(session.codex_session_id)
+            await send_html_chunks(message, format_codex_session_info(session, last_run))
+            return
+        if action == "codex_status":
+            active_run = session_manager.get_active_codex_run_for_chat(message.chat.id)
+            if active_run is None:
+                await message.answer(
+                    "<b>No active Codex run.</b>\nUse <b>Codex</b> and send a task.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            active_session = session_manager.get_codex_session(active_run.codex_session_id)
+            model_label = (
+                active_run.model_name
+                or (active_session.default_model if active_session is not None else "")
+                or settings.codex_model
+                or "default"
+            )
+            effort_label = (
+                active_run.reasoning_effort
+                or (
+                    active_session.default_reasoning_effort
+                    if active_session is not None
+                    else ""
+                )
+                or settings.codex_reasoning_effort
+                or "default"
+            )
+            await message.answer(
+                "<b>Codex Run Status</b>\n"
+                f"<b>Run:</b> <code>{escape(active_run.codex_run_id)}</code>\n"
+                f"<b>Status:</b> <code>{escape(active_run.status)}</code>\n"
+                f"<b>Workspace:</b> <code>{escape(str(active_run.workspace_path))}</code>\n"
+                f"<b>Mode:</b> <code>{escape(active_run.run_mode)}</code>\n"
+                f"<b>Model:</b> <code>{escape(model_label)}</code>\n"
+                f"<b>Effort:</b> <code>{escape(effort_label)}</code>\n"
+                f"<b>Started:</b> <code>{escape(format_local_timestamp(active_run.started_at))}</code>",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            return
+        if action == "codex_logs":
+            last_run = get_latest_codex_run_for_chat(message.chat.id)
+            if last_run is None:
+                await message.answer(
+                    "<b>No Codex run logs yet.</b>\nSend your first Codex task.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            await send_html_chunks(message, format_codex_logs(last_run))
+            return
+        if action == "codex_retry":
+            last_run = get_latest_codex_run_for_chat(message.chat.id)
+            if last_run is None or not last_run.prompt_text.strip():
+                await message.answer(
+                    "<b>No retry target found.</b>\nRun at least one Codex task first.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            session = session_manager.get_codex_session(last_run.codex_session_id)
+            if session is None:
+                await message.answer(
+                    "<b>Codex session record is missing for retry.</b>",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            await message.answer(
+                "<b>Retrying latest Codex task...</b>",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            await do_codex_prompt(
+                message,
+                user.id,
+                last_run.prompt_text,
+                run_mode=last_run.run_mode,
+                model_name=(last_run.model_name or settings.codex_model),
+                reasoning_effort=(last_run.reasoning_effort or settings.codex_reasoning_effort),
+                workspace_path=last_run.workspace_path,
+            )
+            return
+        if action == "codex_changes":
+            last_run = get_latest_codex_run_for_chat(message.chat.id)
+            if last_run is None:
+                await message.answer(
+                    "<b>No Codex run found.</b>\nRun a task first.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            changes_text = format_codex_changes_summary(last_run)
+            if not changes_text:
+                await message.answer(
+                    "<b>No change summary available.</b>",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            await send_html_chunks(message, changes_text)
+            return
+        if action == "codex_files":
+            last_run = get_latest_codex_run_for_chat(message.chat.id)
+            if last_run is None:
+                await message.answer(
+                    "<b>No Codex run found.</b>\nRun a task first.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            files_text = format_codex_changed_files(last_run)
+            if not files_text:
+                await message.answer(
+                    "<b>No changed files reported.</b>",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            await send_html_chunks(message, files_text)
+            return
+        if action == "codex_patch":
+            last_run = get_latest_codex_run_for_chat(message.chat.id)
+            if last_run is None:
+                await message.answer(
+                    "<b>No Codex run found.</b>\nRun a task first.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            await message.answer(
+                "<b>Select patch scope</b>\nChoose how broad the exported patch should be.",
+                parse_mode="HTML",
+                reply_markup=codex_patch_scope_keyboard(last_run.codex_run_id),
+            )
+            return
+        if action == "codex_cancel":
+            active_run = session_manager.get_active_codex_run_for_chat(message.chat.id)
+            if active_run is None:
+                await message.answer(
+                    "<b>No active Codex run.</b>",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            cancelled = await codex_runner.cancel_run(active_run.codex_run_id)
+            if not cancelled:
+                await message.answer(
+                    "<b>Cancel request could not be applied.</b>\n"
+                    "The run may already be finishing.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            await message.answer(
+                "<b>Cancel requested.</b>\nWaiting for Codex process to exit...",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            return
+        if action == "codex_end":
+            active_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+            if active_session is not None:
+                session_manager.close_codex_session(active_session.codex_session_id)
+            reset_pending_codex_context(user.id, message.chat.id)
+            await message.answer(
+                "<b>Codex closed</b>\nYou can reopen it any time from the keyboard.",
+                parse_mode="HTML",
+                reply_markup=persistent_control_keyboard(),
+            )
+            return
+        if action in {"codex_approve", "codex_reject", "codex_allow"}:
+            context = get_or_create_pending_codex_context(user.id, message.chat.id)
+            if not context.approval_pending or context.awaiting != "approval":
+                await message.answer(
+                    "<b>No approval is pending.</b>",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            approval_question = context.approval_question or "No additional details."
+            if action == "codex_reject":
+                context.approval_pending = False
+                context.awaiting = "task"
+                context.approval_question = ""
+                context.approval_run_id = ""
+                await message.answer(
+                    "<b>Approval rejected.</b>\nSend a new task or adjust mode/dir/model.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            context.approval_pending = False
+            context.awaiting = "task"
+            context.approval_question = ""
+            context.approval_run_id = ""
+            if action == "codex_allow":
+                context.session_allow_approvals = True
+                decision_line = "APPROVED for this session."
+            else:
+                decision_line = "APPROVED once."
+            await message.answer(
+                f"<b>{decision_line}</b>\nContinuing Codex...",
+                parse_mode="HTML",
+                reply_markup=codex_control_keyboard(),
+            )
+            await do_codex_prompt(
+                message,
+                user.id,
+                (
+                    "Approval decision from operator: "
+                    + decision_line
+                    + "\nRequested approval: "
+                    + approval_question
+                    + "\nContinue from the current session context."
+                ),
+                run_mode=context.run_mode,
+                model_name=context.model_name,
+                reasoning_effort=context.reasoning_effort,
+                workspace_path=context.workspace_path,
+            )
+            return
+        if action == "back_main":
+            pending = pending_codex_by_chat_user.get(codex_context_key(user.id, message.chat.id))
+            if pending is not None:
+                if pending.awaiting in {"workspace", "model_pick", "effort_pick", "approval"}:
+                    pending.awaiting = "task"
+                elif pending.panel in {"run", "review"}:
+                    pending.panel = "main"
+                elif pending.awaiting != "task":
+                    pending.awaiting = "task"
+                pending.awaiting = "task"
+                await message.answer(
+                    "<b>Codex controls restored.</b>\n"
+                    + format_codex_profile_card(
+                        pending.workspace_path,
+                        pending.run_mode,
+                        pending.model_name or settings.codex_model,
+                        pending.reasoning_effort or settings.codex_reasoning_effort,
+                        state_label="task",
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(pending.panel),
+                )
+                return
+            reset_pending_codex_context(user.id, message.chat.id)
+            await message.answer("Main controls restored.", reply_markup=persistent_control_keyboard())
             return
 
     @dp.message(Command("run"))
@@ -3127,6 +4874,33 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         if not text:
             return
 
+        pending_codex = pending_codex_by_chat_user.get(codex_context_key(user.id, message.chat.id))
+        if await handle_pending_codex_workspace_input(message, user.id, text):
+            return
+        if await handle_pending_codex_picker_input(message, user.id, text):
+            return
+
+        if pending_codex is not None and pending_codex.awaiting == "task":
+            pending_codex.awaiting = None
+            await do_codex_prompt(
+                message,
+                user.id,
+                text,
+                run_mode=pending_codex.run_mode,
+                model_name=pending_codex.model_name,
+                reasoning_effort=pending_codex.reasoning_effort,
+                workspace_path=pending_codex.workspace_path,
+            )
+            return
+        if pending_codex is not None and pending_codex.awaiting == "approval":
+            await message.answer(
+                "<b>Codex is waiting for approval.</b>\n"
+                f"Use <b>{BTN_CODEX_APPROVE}</b>, <b>{BTN_CODEX_REJECT}</b>, or <b>{BTN_CODEX_ALLOW}</b>.",
+                parse_mode="HTML",
+                reply_markup=codex_approval_keyboard(),
+            )
+            return
+
         session = session_manager.get_active_session_for_user(user.id)
         if session:
             master_fd = session.pty_master_fd
@@ -3149,6 +4923,21 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
                 await message.answer("Could not send text to active session.")
             return
 
+        codex_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+        if codex_session is not None:
+            await do_codex_prompt(
+                message,
+                user.id,
+                text,
+                run_mode=codex_session.default_mode,
+                model_name=codex_session.default_model or settings.codex_model,
+                reasoning_effort=(
+                    codex_session.default_reasoning_effort or settings.codex_reasoning_effort
+                ),
+                workspace_path=codex_session.workspace_path,
+            )
+            return
+
         current_dir = session_manager.get_current_workdir(user.id)
         running_count = session_manager.count_running_sessions_for_user(user.id)
         hint = (
@@ -3159,7 +4948,7 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         await message.answer(
             f"<b>No active route for plain text</b>\n"
             f"<b>Current dir:</b> <code>{escape(str(current_dir))}</code>\n"
-            f"<b>Use:</b> <code>/run &lt;command&gt;</code> for shell."
+            f"<b>Use:</b> <code>/run &lt;command&gt;</code> for shell or the <b>Codex</b> keyboard button for Codex."
             f"{hint}",
             parse_mode="HTML",
             reply_markup=context_control_keyboard("help", "status"),
@@ -3170,6 +4959,72 @@ def build_dispatcher(settings: Settings, session_manager: SessionManager) -> Dis
         user = message.from_user
         if not user or not is_allowed(user.id, settings):
             return
+
+        text = (message.text or "").strip()
+        if text:
+            pending_codex = pending_codex_by_chat_user.get(codex_context_key(user.id, message.chat.id))
+            if await handle_pending_codex_workspace_input(message, user.id, text):
+                return
+            if await handle_pending_codex_picker_input(message, user.id, text):
+                return
+
+            if pending_codex is not None and pending_codex.awaiting == "task":
+                await message.answer(
+                    "<b>Waiting for Codex task text.</b>\n"
+                    "Slash commands are reserved for bot commands.\n"
+                    "Send plain task text or tap <b>Back</b>.",
+                    parse_mode="HTML",
+                    reply_markup=codex_control_keyboard(),
+                )
+                return
+            if pending_codex is not None and pending_codex.awaiting in {"model_pick", "effort_pick"}:
+                picker_markup = (
+                    codex_model_picker_keyboard(
+                        [m for m in settings.codex_available_models if m.strip()],
+                        current=pending_codex.model_name or settings.codex_model,
+                    )
+                    if pending_codex.awaiting == "model_pick"
+                    else codex_effort_picker_keyboard(
+                        [e.strip().lower() for e in settings.codex_available_reasoning_efforts if e.strip()],
+                        current=pending_codex.reasoning_effort or settings.codex_reasoning_effort,
+                    )
+                )
+                await message.answer(
+                    "<b>Selection is pending.</b>\n"
+                    "Choose from the visible buttons or tap <b>Back</b>.",
+                    parse_mode="HTML",
+                    reply_markup=picker_markup,
+                )
+                return
+            if pending_codex is not None and pending_codex.awaiting == "approval":
+                await message.answer(
+                    "<b>Codex is waiting for approval.</b>\n"
+                    f"Use <b>{BTN_CODEX_APPROVE}</b>, <b>{BTN_CODEX_REJECT}</b>, or <b>{BTN_CODEX_ALLOW}</b>.",
+                    parse_mode="HTML",
+                    reply_markup=codex_approval_keyboard(),
+                )
+                return
+
+            # In Codex chat mode, unknown slash-prefixed text should continue the
+            # active Codex session instead of surfacing "Unknown command".
+            active_shell = session_manager.get_active_session_for_user(user.id)
+            if active_shell is None:
+                codex_session = session_manager.get_active_codex_session_for_chat(message.chat.id)
+                if codex_session is not None:
+                    await do_codex_prompt(
+                        message,
+                        user.id,
+                        text,
+                        run_mode=codex_session.default_mode,
+                        model_name=codex_session.default_model or settings.codex_model,
+                        reasoning_effort=(
+                            codex_session.default_reasoning_effort
+                            or settings.codex_reasoning_effort
+                        ),
+                        workspace_path=codex_session.workspace_path,
+                    )
+                    return
+
         await message.answer(
             "Unknown command.\nUse <code>/help</code>.",
             parse_mode="HTML",

@@ -50,6 +50,7 @@ This project focuses on practical VPS workflows:
 - `/stream on|off|toggle|status` Control stream mode
 - `/live ...` Alias for `/stream ...`
 - `/get <path>` Download file from VPS
+- `/codex <task>` Run Codex non-interactively in the current workspace
 
 Buffer behavior:
 - In stream `on`, buffer is cleared before each new interactive input.
@@ -65,6 +66,28 @@ Output rendering behavior:
 - `key=value` and `key: value` lines render as key + value units instead of word-by-word.
 - Table-like and log-like lines keep readable structured monospace output.
 
+Codex behavior:
+- `/codex <task>` runs Codex non-interactively in the user's current working directory.
+- `Codex` on the reply keyboard opens a workspace panel and is the preferred UX.
+- The panel defaults to the directory where the user opened Codex.
+- From the panel, the user can:
+  - start by sending task text directly
+  - toggle continue/new mode
+  - choose model from a button list
+  - choose reasoning effort (`low`/`medium`/`high`, configurable)
+  - change directory
+  - inspect status/session
+  - fetch latest logs/retry/changes/files/patch
+  - cancel the active run
+  - end the current Codex session
+- If there is an active Codex session and no active shell/PTTY session, plain text continues the Codex chat flow automatically.
+- Shell/PTTY sessions still take precedence for plain text routing, so interactive shell behavior is preserved.
+- Codex also provides post-run inline actions (`Retry`, `Logs`, `Changes`, `Files`, `Export Patch`) under result messages.
+- Each Codex run stores its selected model in SQLite, so status/log views remain accurate after model changes.
+- Each Codex run also stores selected reasoning effort in SQLite.
+- Default model list (when env is unset): `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2`.
+- Default effort list (when env is unset): `low`, `medium`, `high`, `xhigh`.
+
 ## Quick Action Keyboard
 
 Current quick actions shown in chat keyboard:
@@ -79,6 +102,7 @@ Current quick actions shown in chat keyboard:
 - `Stream`
 - `Help`
 - `Open Shell`
+- `Codex`
 
 Quick shell actions:
 - `Open Shell` opens an inline picker for `zsh` and `bash`.

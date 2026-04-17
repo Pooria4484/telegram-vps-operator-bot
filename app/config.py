@@ -64,6 +64,14 @@ class Settings:
     time_offset_minutes: int
     log_level: str
     session_db_path: Path
+    codex_command: str
+    codex_timeout_seconds: int
+    codex_artifacts_dir: Path
+    codex_model: str
+    codex_available_models: list[str]
+    codex_reasoning_effort: str
+    codex_available_reasoning_efforts: list[str]
+    codex_sandbox_mode: str
 
 
 def load_settings() -> Settings:
@@ -72,6 +80,26 @@ def load_settings() -> Settings:
         raise RuntimeError("BOT_TOKEN is missing")
 
     allowed_user_ids = _parse_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
+
+    codex_model = os.getenv("CODEX_MODEL", "").strip()
+    raw_models = os.getenv("CODEX_AVAILABLE_MODELS", "").strip()
+    if raw_models:
+        codex_available_models = [item.strip() for item in raw_models.split(",") if item.strip()]
+    elif codex_model:
+        codex_available_models = [codex_model]
+    else:
+        codex_available_models = ["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"]
+
+    codex_reasoning_effort = os.getenv("CODEX_REASONING_EFFORT", "").strip()
+    raw_efforts = os.getenv("CODEX_AVAILABLE_REASONING_EFFORTS", "").strip()
+    if raw_efforts:
+        codex_available_reasoning_efforts = [
+            item.strip().lower() for item in raw_efforts.split(",") if item.strip()
+        ]
+    elif codex_reasoning_effort:
+        codex_available_reasoning_efforts = [codex_reasoning_effort.lower()]
+    else:
+        codex_available_reasoning_efforts = ["low", "medium", "high", "xhigh"]
 
     return Settings(
         bot_token=bot_token,
@@ -90,4 +118,14 @@ def load_settings() -> Settings:
         session_db_path=Path(
             os.getenv("SESSION_DB_PATH", "./session_store.sqlite3")
         ).expanduser(),
+        codex_command=os.getenv("CODEX_COMMAND", "codex").strip() or "codex",
+        codex_timeout_seconds=_parse_positive_int_env("CODEX_TIMEOUT_SECONDS", 1800),
+        codex_artifacts_dir=Path(
+            os.getenv("CODEX_ARTIFACTS_DIR", "./codex_artifacts")
+        ).expanduser(),
+        codex_model=codex_model,
+        codex_available_models=codex_available_models,
+        codex_reasoning_effort=codex_reasoning_effort.lower(),
+        codex_available_reasoning_efforts=codex_available_reasoning_efforts,
+        codex_sandbox_mode=os.getenv("CODEX_SANDBOX_MODE", "workspace-write").strip() or "workspace-write",
     )
