@@ -63,6 +63,7 @@ class PendingUpload:
     file_id: str
     file_name: str
     target_path: Path
+    file_size: int | None = None
 
 
 class SessionManager:

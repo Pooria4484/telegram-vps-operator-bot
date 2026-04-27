@@ -154,7 +154,10 @@ ALLOWED_USER_IDS=123456789,987654321
 DEFAULT_SHELL=/bin/bash
 WORKDIR=/home/your-user
 MAX_TAIL_LINES=30
-MAX_UPLOAD_BYTES=20971520
+MAX_UPLOAD_BYTES=1073741824
+TELEGRAM_API_BASE_URL=
+TELEGRAM_API_IS_LOCAL=0
+TELEGRAM_API_FILE_LIMIT_BYTES=20971520
 MAX_RUNNING_SESSIONS_PER_USER=3
 MAX_SESSION_HISTORY_PER_USER=20
 SESSIONS_PAGE_SIZE=5
@@ -164,6 +167,15 @@ TIME_OFFSET=+03:30
 SESSION_DB_PATH=./session_store.sqlite3
 LOG_LEVEL=INFO
 ```
+
+### Upload Size Reality (`MAX_UPLOAD_BYTES` vs Telegram API)
+
+- `MAX_UPLOAD_BYTES` is the bot-side policy limit.
+- Telegram public Bot API has its own file size limit (commonly much lower than 1 GB).
+- To actually allow large uploads (for example 1 GB), run a Local Telegram Bot API server and set:
+  - `TELEGRAM_API_BASE_URL=http://127.0.0.1:8081`
+  - `TELEGRAM_API_IS_LOCAL=1`
+  - `TELEGRAM_API_FILE_LIMIT_BYTES=1073741824` (or up to your local Bot API capacity)
 
 ### Time Offset (`TIME_OFFSET`)
 

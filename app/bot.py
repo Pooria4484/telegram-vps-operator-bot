@@ -57,6 +57,8 @@ STREAM_FRAME_MAX_BODY_ENTITIES = 80
 RESULT_CHUNK_MAX_CHARS = 3600
 RESULT_CHUNK_MAX_ENTITIES = 350
 RENDER_LINE_SPLIT_MAX_CHARS = 3200
+UPLOAD_PROGRESS_UPDATE_SECONDS = 0.8
+UPLOAD_PROGRESS_BAR_WIDTH = 18
 logger = logging.getLogger(__name__)
 
 BTN_STATUS = "Status"
@@ -130,6 +132,13 @@ class PendingKill:
     request_id: str
     telegram_user_id: int
     session_id: str
+
+
+@dataclass(slots=True)
+class UploadPayload:
+    file_id: str
+    file_name: str
+    file_size: int | None
 
 
 @dataclass(slots=True)
@@ -213,11 +222,172 @@ def normalize_picker_selection(raw_text: str) -> str:
     return text
 
 
-async def save_telegram_file(message: Message, file_id: str, target_path: Path) -> None:
-    telegram_file = await message.bot.get_file(file_id)
+def _build_upload_progress_bar(percent: int) -> str:
+    clamped = max(0, min(100, percent))
+    filled = int((clamped / 100) * UPLOAD_PROGRESS_BAR_WIDTH)
+    return f"[{'#' * filled}{'.' * (UPLOAD_PROGRESS_BAR_WIDTH - filled)}]"
+
+
+def render_upload_progress_text(file_name: str, downloaded_bytes: int, total_bytes: int | None) -> str:
+    safe_name = escape(file_name)
+    if total_bytes and total_bytes > 0:
+        percent = int((downloaded_bytes * 100) / total_bytes)
+        percent = max(0, min(100, percent))
+        return (
+            "<b>Uploading to VPS</b>\n"
+            f"<b>File:</b> <code>{safe_name}</code>\n"
+            f"<b>Progress:</b> <code>{_build_upload_progress_bar(percent)} {percent}%</code>\n"
+            f"<b>Size:</b> <code>{format_size(downloaded_bytes)} / {format_size(total_bytes)}</code>"
+        )
+    return (
+        "<b>Uploading to VPS</b>\n"
+        f"<b>File:</b> <code>{safe_name}</code>\n"
+        f"<b>Downloaded:</b> <code>{format_size(downloaded_bytes)}</code>"
+    )
+
+
+def render_upload_limit_text(file_size: int, limit: int, reason: str) -> str:
+    return (
+        f"<b>Upload failed</b>\n"
+        f"<b>Reason:</b> <code>{escape(reason)}</code>\n"
+        f"<b>File size:</b> <code>{format_size(file_size)}</code>\n"
+        f"<b>Limit:</b> <code>{format_size(limit)}</code>"
+    )
+
+
+def render_telegram_api_limit_text(file_size: int | None, telegram_limit: int) -> str:
+    size_line = ""
+    if file_size and file_size > 0:
+        size_line = f"<b>File size:</b> <code>{format_size(file_size)}</code>\n"
+    return (
+        f"<b>Upload failed</b>\n"
+        f"<b>Reason:</b> <code>telegram bot api file limit</code>\n"
+        f"{size_line}"
+        f"<b>Telegram API limit:</b> <code>{format_size(telegram_limit)}</code>\n"
+        f"<b>Hint:</b> <code>use local telegram-bot-api server for larger files</code>"
+    )
+
+
+def pick_upload_payload(message: Message) -> UploadPayload | None:
+    if message.document:
+        document = message.document
+        if not document.file_name:
+            return None
+        return UploadPayload(
+            file_id=document.file_id,
+            file_name=document.file_name,
+            file_size=document.file_size,
+        )
+
+    if message.video:
+        video = message.video
+        file_name = video.file_name or f"video_{video.file_unique_id}.mp4"
+        return UploadPayload(file_id=video.file_id, file_name=file_name, file_size=video.file_size)
+
+    if message.audio:
+        audio = message.audio
+        file_name = audio.file_name or f"audio_{audio.file_unique_id}.mp3"
+        return UploadPayload(file_id=audio.file_id, file_name=file_name, file_size=audio.file_size)
+
+    if message.animation:
+        animation = message.animation
+        file_name = animation.file_name or f"animation_{animation.file_unique_id}.mp4"
+        return UploadPayload(
+            file_id=animation.file_id,
+            file_name=file_name,
+            file_size=animation.file_size,
+        )
+
+    if message.voice:
+        voice = message.voice
+        file_name = f"voice_{voice.file_unique_id}.ogg"
+        return UploadPayload(file_id=voice.file_id, file_name=file_name, file_size=voice.file_size)
+
+    if message.video_note:
+        video_note = message.video_note
+        file_name = f"video_note_{video_note.file_unique_id}.mp4"
+        return UploadPayload(
+            file_id=video_note.file_id,
+            file_name=file_name,
+            file_size=video_note.file_size,
+        )
+
+    if message.sticker:
+        sticker = message.sticker
+        ext = ".webp"
+        if sticker.is_video:
+            ext = ".webm"
+        elif sticker.is_animated:
+            ext = ".tgs"
+        file_name = f"sticker_{sticker.file_unique_id}{ext}"
+        return UploadPayload(file_id=sticker.file_id, file_name=file_name, file_size=sticker.file_size)
+
+    if message.photo:
+        photo = message.photo[-1]
+        file_name = f"photo_{photo.file_unique_id}.jpg"
+        return UploadPayload(file_id=photo.file_id, file_name=file_name, file_size=photo.file_size)
+
+    return None
+
+
+async def _upload_progress_reporter(
+    progress_message: Message,
+    target_path: Path,
+    file_name: str,
+    total_bytes: int | None,
+    done: asyncio.Event,
+) -> None:
+    last_rendered = ""
+    while True:
+        downloaded_bytes = 0
+        with contextlib.suppress(OSError):
+            downloaded_bytes = target_path.stat().st_size
+        if done.is_set() and total_bytes and total_bytes > 0:
+            downloaded_bytes = max(downloaded_bytes, total_bytes)
+        text = render_upload_progress_text(file_name, downloaded_bytes, total_bytes)
+        if text != last_rendered:
+            try:
+                await progress_message.edit_text(text, parse_mode="HTML")
+                last_rendered = text
+            except TelegramBadRequest:
+                pass
+            except Exception:
+                logger.debug("Upload progress edit failed", exc_info=True)
+        if done.is_set():
+            return
+        await asyncio.sleep(UPLOAD_PROGRESS_UPDATE_SECONDS)
+
+
+async def save_telegram_file(
+    bot: Bot,
+    file_id: str,
+    target_path: Path,
+    file_name: str,
+    file_size: int | None = None,
+    progress_message: Message | None = None,
+) -> None:
+    telegram_file = await bot.get_file(file_id)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    with target_path.open("wb") as out:
-        await message.bot.download_file(telegram_file.file_path, destination=out)
+    done = asyncio.Event()
+    progress_task: asyncio.Task[None] | None = None
+    if progress_message:
+        progress_task = asyncio.create_task(
+            _upload_progress_reporter(
+                progress_message=progress_message,
+                target_path=target_path,
+                file_name=file_name,
+                total_bytes=file_size,
+                done=done,
+            )
+        )
+    try:
+        with target_path.open("wb") as out:
+            await bot.download_file(telegram_file.file_path, destination=out)
+    finally:
+        done.set()
+        if progress_task:
+            with contextlib.suppress(Exception):
+                await progress_task
 
 
 def upload_confirm_keyboard(request_id: str) -> InlineKeyboardMarkup:
@@ -3642,35 +3812,59 @@ def build_dispatcher(
             )
 
     @dp.message(F.document)
+    @dp.message(F.video)
+    @dp.message(F.audio)
+    @dp.message(F.animation)
+    @dp.message(F.voice)
+    @dp.message(F.video_note)
+    @dp.message(F.sticker)
+    @dp.message(F.photo)
     async def upload_document_handler(message: Message) -> None:
         user = message.from_user
         if not user or not is_allowed(user.id, settings):
             return
 
-        document = message.document
-        if not document or not document.file_name:
-            await message.answer("Upload failed: missing file name.")
+        upload = pick_upload_payload(message)
+        if not upload:
+            await message.answer("Upload failed: unsupported file payload.")
             return
 
-        if document.file_size and document.file_size > settings.max_upload_bytes:
+        if upload.file_size and upload.file_size > settings.max_upload_bytes:
             logger.warning(
                 "Upload rejected (size limit): user_id=%s name=%r size=%s limit=%s",
                 user.id,
-                document.file_name,
-                document.file_size,
+                upload.file_name,
+                upload.file_size,
                 settings.max_upload_bytes,
             )
             await message.answer(
-                f"<b>Upload failed</b>\n"
-                f"<b>Reason:</b> <code>file is too large</code>\n"
-                f"<b>File size:</b> <code>{format_size(document.file_size)}</code>\n"
-                f"<b>Limit:</b> <code>{format_size(settings.max_upload_bytes)}</code>",
+                render_upload_limit_text(
+                    file_size=upload.file_size,
+                    limit=settings.max_upload_bytes,
+                    reason="file is too large",
+                ),
+                parse_mode="HTML",
+            )
+            return
+        if upload.file_size and upload.file_size > settings.telegram_api_file_limit_bytes:
+            logger.warning(
+                "Upload rejected (telegram api limit): user_id=%s name=%r size=%s api_limit=%s",
+                user.id,
+                upload.file_name,
+                upload.file_size,
+                settings.telegram_api_file_limit_bytes,
+            )
+            await message.answer(
+                render_telegram_api_limit_text(
+                    file_size=upload.file_size,
+                    telegram_limit=settings.telegram_api_file_limit_bytes,
+                ),
                 parse_mode="HTML",
             )
             return
 
         try:
-            safe_name = sanitize_uploaded_filename(document.file_name)
+            safe_name = sanitize_uploaded_filename(upload.file_name)
         except ValueError:
             await message.answer("Upload failed: invalid file name.")
             return
@@ -3683,9 +3877,10 @@ def build_dispatcher(
                 request_id=secrets.token_hex(4),
                 telegram_user_id=user.id,
                 chat_id=message.chat.id,
-                file_id=document.file_id,
+                file_id=upload.file_id,
                 file_name=safe_name,
                 target_path=target_path,
+                file_size=upload.file_size,
             )
             session_manager.set_pending_upload(
                 pending
@@ -3699,8 +3894,23 @@ def build_dispatcher(
             )
             return
 
+        progress_message = await message.answer(
+            render_upload_progress_text(
+                file_name=safe_name,
+                downloaded_bytes=0,
+                total_bytes=upload.file_size,
+            ),
+            parse_mode="HTML",
+        )
         try:
-            await save_telegram_file(message, document.file_id, target_path)
+            await save_telegram_file(
+                bot=message.bot,
+                file_id=upload.file_id,
+                target_path=target_path,
+                file_name=safe_name,
+                file_size=upload.file_size,
+                progress_message=progress_message,
+            )
             actual_size = target_path.stat().st_size
             if actual_size > settings.max_upload_bytes:
                 with contextlib.suppress(OSError):
@@ -3713,10 +3923,11 @@ def build_dispatcher(
                     settings.max_upload_bytes,
                 )
                 await message.answer(
-                    f"<b>Upload failed</b>\n"
-                    f"<b>Reason:</b> <code>file is too large</code>\n"
-                    f"<b>File size:</b> <code>{format_size(actual_size)}</code>\n"
-                    f"<b>Limit:</b> <code>{format_size(settings.max_upload_bytes)}</code>",
+                    render_upload_limit_text(
+                        file_size=actual_size,
+                        limit=settings.max_upload_bytes,
+                        reason="file is too large",
+                    ),
                     parse_mode="HTML",
                 )
                 return
@@ -3727,8 +3938,10 @@ def build_dispatcher(
                 target_path,
                 actual_size,
             )
-            await message.answer(
+            await progress_message.edit_text(
                 f"<b>Uploaded</b>\n"
+                f"<b>Path:</b> <code>{escape(str(target_path))}</code>\n"
+                f"<b>Size:</b> <code>{format_size(actual_size)}</code>\n"
                 f"<b>SHA256:</b> <code>{file_sha256}</code>",
                 parse_mode="HTML",
             )
@@ -3736,9 +3949,18 @@ def build_dispatcher(
             logger.exception(
                 "Upload failed with exception: user_id=%s file_name=%r",
                 user.id,
-                document.file_name if document else None,
+                upload.file_name,
             )
-            await message.answer(
+            if isinstance(exc, TelegramBadRequest) and "file is too big" in str(exc).lower():
+                await progress_message.edit_text(
+                    render_telegram_api_limit_text(
+                        file_size=upload.file_size or 0,
+                        telegram_limit=settings.telegram_api_file_limit_bytes,
+                    ),
+                    parse_mode="HTML",
+                )
+                return
+            await progress_message.edit_text(
                 f"<b>Upload failed</b>\n"
                 f"<b>Error:</b> <code>{escape(str(exc))}</code>",
                 parse_mode="HTML",
@@ -3804,27 +4026,69 @@ def build_dispatcher(
 
         if callback.message:
             await callback.message.edit_text(
-                f"<b>Overwriting</b>\n"
-                f"<b>Path:</b> <code>{escape(str(pending.target_path))}</code>",
+                render_upload_progress_text(
+                    file_name=pending.file_name,
+                    downloaded_bytes=0,
+                    total_bytes=pending.file_size,
+                ),
                 parse_mode="HTML",
             )
 
         try:
-            telegram_file = await callback.bot.get_file(pending.file_id)
-            pending.target_path.parent.mkdir(parents=True, exist_ok=True)
-            with pending.target_path.open("wb") as out:
-                await callback.bot.download_file(telegram_file.file_path, destination=out)
+            await save_telegram_file(
+                bot=callback.bot,
+                file_id=pending.file_id,
+                target_path=pending.target_path,
+                file_name=pending.file_name,
+                file_size=pending.file_size,
+                progress_message=callback.message,
+            )
+            actual_size = pending.target_path.stat().st_size
+            if actual_size > settings.max_upload_bytes:
+                with contextlib.suppress(OSError):
+                    pending.target_path.unlink()
+                logger.warning(
+                    "Upload removed after overwrite (size limit): user_id=%s path=%s size=%s limit=%s",
+                    user.id,
+                    pending.target_path,
+                    actual_size,
+                    settings.max_upload_bytes,
+                )
+                if callback.message:
+                    await callback.message.edit_text(
+                        render_upload_limit_text(
+                            file_size=actual_size,
+                            limit=settings.max_upload_bytes,
+                            reason="file is too large",
+                        ),
+                        parse_mode="HTML",
+                    )
+                await callback.answer("Upload failed.", show_alert=False)
+                return
 
             file_sha256 = sha256_file(pending.target_path)
 
             if callback.message:
                 await callback.message.edit_text(
                     f"<b>Uploaded</b>\n"
+                    f"<b>Path:</b> <code>{escape(str(pending.target_path))}</code>\n"
+                    f"<b>Size:</b> <code>{format_size(actual_size)}</code>\n"
                     f"<b>SHA256:</b> <code>{file_sha256}</code>",
                     parse_mode="HTML",
                 )
             await callback.answer("Upload overwritten.", show_alert=False)
         except Exception as exc:
+            if isinstance(exc, TelegramBadRequest) and "file is too big" in str(exc).lower():
+                if callback.message:
+                    await callback.message.edit_text(
+                        render_telegram_api_limit_text(
+                            file_size=pending.file_size or 0,
+                            telegram_limit=settings.telegram_api_file_limit_bytes,
+                        ),
+                        parse_mode="HTML",
+                    )
+                await callback.answer("Upload failed.", show_alert=False)
+                return
             if callback.message:
                 await callback.message.edit_text(
                     f"<b>Upload failed</b>\n"

@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"019da56f-0c01-7472-a8f1-90dc360cb845"}
+{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 2/5 (timeout waiting for child process to exit)"}
+{"type":"error","message":"Reconnecting... 3/5 (timeout waiting for child process to exit)"}
+{"type":"error","message":"Reconnecting... 4/5 (timeout waiting for child process to exit)"}
+{"type":"error","message":"Reconnecting... 5/5 (timeout waiting for child process to exit)"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/usr/bin/zsh -lc pwd","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/usr/bin/zsh -lc pwd","aggregated_output":"/home/pooria/wm\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"status\":\"success\",\"summary_short\":\"Current working directory: /home/pooria/wm\",\"summary_full\":\"Ran `pwd` in the workspace and confirmed the current working directory is `/home/pooria/wm`.\",\"what_changed\":[],\"changed_files\":[],\"checks\":[{\"name\":\"pwd\",\"status\":\"passed\",\"details\":\"Confirmed current directory is /home/pooria/wm\"}],\"result_for_user\":\"/home/pooria/wm\",\"next_steps\":[],\"needs_user_input\":false,\"user_input_question\":\"\",\"debug\":{\"commands_run\":[\"pwd\"],\"notes\":[]}}"}}
+{"type":"turn.completed","usage":{"input_tokens":24675,"cached_input_tokens":14720,"output_tokens":266}}

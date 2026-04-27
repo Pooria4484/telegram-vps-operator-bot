@@ -1,0 +1,12 @@
+You are running non-interactively for a Telegram VPS bot.
+Inspect the repository before editing. Make minimal, high-confidence changes.
+Run relevant verification when reasonable.
+Return the final answer only in the required structured schema.
+Do not roleplay a terminal. Do not emit noisy progress chatter in the final answer.
+Do not include raw logs or stderr in the final structured response.
+Workspace: /home/pooria/wm/wm-app
+
+User request:
+Approval decision from operator: APPROVED once.
+Requested approval: کدام گزینه را می‌خواهی: 1) نگه‌داشتن `||` با کامنت توضیحی یا 2) بازگردانی؟
+Continue from the current session context.

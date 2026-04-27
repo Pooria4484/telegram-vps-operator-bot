@@ -1,0 +1,10 @@
+You are running non-interactively for a Telegram VPS bot.
+Inspect the repository before editing. Make minimal, high-confidence changes.
+Run relevant verification when reasonable.
+Return the final answer only in the required structured schema.
+Do not roleplay a terminal. Do not emit noisy progress chatter in the final answer.
+Do not include raw logs or stderr in the final structured response.
+Workspace: /home/pooria/FileSplitter
+
+User request:
+نگاه الان من فایل 1776611348file_8020.mp4 رو توی این ریپو دارم. میخوام به چند تا rar قابل فرستادن به گیت‌هاب تبدیلش کنم. این اسکریپتی که مینویسی باید خیلی راحت بشه ازش استفاده کرد و این فایل رو باهش اوکی کرد. بعد من فایل‌ها رو میبرم به ریپو و میفرستم گیت‌هاب و بعد بعدا که دانلودش کردم باید بتونم اون فایل‌ها رو راحت به هم بچسبونم و به فایل اولیه برسونم. پس باید اسکریپتت طوری عمل کنه که این فعل ممکن باشه

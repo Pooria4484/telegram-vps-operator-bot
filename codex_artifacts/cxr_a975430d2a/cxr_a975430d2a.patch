@@ -1,0 +1,63 @@
+diff --git a/Core/Src/SocketDma.c b/Core/Src/SocketDma.c
+index 211ba12..cc87259 100644
+--- a/Core/Src/SocketDma.c
++++ b/Core/Src/SocketDma.c
+@@ -1,4 +1,4 @@
+-#include "socketDma.h"
++#include "SocketDma.h"
+ extern UART_HandleTypeDef huart1;
+ extern DMA_HandleTypeDef hdma_usart1_rx;
+ extern DMA_HandleTypeDef hdma_usart1_tx;
+diff --git a/Core/Src/main.c b/Core/Src/main.c
+index 08bd42a..e9a484b 100644
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -22,7 +22,7 @@
+ 
+ /* Private includes ----------------------------------------------------------*/
+ /* USER CODE BEGIN Includes */
+-#include "socketDma.h"
++#include "SocketDma.h"
+ #include "stm32f1xx_it.h"
+ #include "stdio.h"
+ #include "math.h"
+@@ -6874,8 +6874,8 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+ 			nr3++;
+ 			if (nr3 > 1)
+ 			{
+-				if ((nrcnt < 9) && (nrcnt > 11))
+-					nr3 = 0;
++				if ((nrcnt < 9) || (nrcnt > 11))
++					nr3 = 0;
+ 			}
+ 		}
+ 		else if ((nrcnt > 8) && (nrcnt < 12))
+diff --git a/codex_artifacts/cxr_c613967513.patch b/codex_artifacts/cxr_c613967513.patch
+new file mode 100644
+index 0000000..a1a56be
+--- /dev/null
++++ b/codex_artifacts/cxr_c613967513.patch
+@@ -0,0 +1,23 @@
++diff --git a/Core/Src/SocketDma.c b/Core/Src/SocketDma.c
++index 211ba12..cc87259 100644
++--- a/Core/Src/SocketDma.c
+++++ b/Core/Src/SocketDma.c
++@@ -1,4 +1,4 @@
++-#include "socketDma.h"
+++#include "SocketDma.h"
++ extern UART_HandleTypeDef huart1;
++ extern DMA_HandleTypeDef hdma_usart1_rx;
++ extern DMA_HandleTypeDef hdma_usart1_tx;
++diff --git a/Core/Src/main.c b/Core/Src/main.c
++index 08bd42a..42add80 100644
++--- a/Core/Src/main.c
+++++ b/Core/Src/main.c
++@@ -22,7 +22,7 @@
++ 
++ /* Private includes ----------------------------------------------------------*/
++ /* USER CODE BEGIN Includes */
++-#include "socketDma.h"
+++#include "SocketDma.h"
++ #include "stm32f1xx_it.h"
++ #include "stdio.h"
++ #include "math.h"

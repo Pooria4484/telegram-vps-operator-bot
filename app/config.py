@@ -32,6 +32,15 @@ def _parse_positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean (1/0, true/false, yes/no)")
+
+
 def _parse_time_offset_minutes(name: str, default: str) -> int:
     raw = os.getenv(name, default).strip()
     match = re.fullmatch(r"([+-]?)(\d{1,2}):(\d{2})", raw)
@@ -56,6 +65,9 @@ class Settings:
     workdir: Path
     max_tail_lines: int
     max_upload_bytes: int
+    telegram_api_file_limit_bytes: int
+    telegram_api_base_url: str
+    telegram_api_is_local: bool
     max_running_sessions_per_user: int
     max_session_history_per_user: int
     sessions_page_size: int
@@ -101,13 +113,21 @@ def load_settings() -> Settings:
     else:
         codex_available_reasoning_efforts = ["low", "medium", "high", "xhigh"]
 
+    telegram_api_is_local = _parse_bool_env("TELEGRAM_API_IS_LOCAL", False)
+    default_telegram_api_file_limit = 2 * 1024 * 1024 * 1024 if telegram_api_is_local else 20 * 1024 * 1024
+
     return Settings(
         bot_token=bot_token,
         allowed_user_ids=allowed_user_ids,
         default_shell=os.getenv("DEFAULT_SHELL", "/bin/bash").strip(),
         workdir=Path(os.getenv("WORKDIR", str(Path.home()))).expanduser(),
         max_tail_lines=_parse_positive_int_env("MAX_TAIL_LINES", 30),
-        max_upload_bytes=_parse_positive_int_env("MAX_UPLOAD_BYTES", 20 * 1024 * 1024),
+        max_upload_bytes=_parse_positive_int_env("MAX_UPLOAD_BYTES", 1024 * 1024 * 1024),
+        telegram_api_file_limit_bytes=_parse_positive_int_env(
+            "TELEGRAM_API_FILE_LIMIT_BYTES", default_telegram_api_file_limit
+        ),
+        telegram_api_base_url=os.getenv("TELEGRAM_API_BASE_URL", "").strip(),
+        telegram_api_is_local=telegram_api_is_local,
         max_running_sessions_per_user=_parse_positive_int_env("MAX_RUNNING_SESSIONS_PER_USER", 3),
         max_session_history_per_user=_parse_positive_int_env("MAX_SESSION_HISTORY_PER_USER", 20),
         sessions_page_size=_parse_positive_int_env("SESSIONS_PAGE_SIZE", 5),

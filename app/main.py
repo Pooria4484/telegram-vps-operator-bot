@@ -4,6 +4,8 @@ import asyncio
 import logging
 
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.types import BotCommandScopeAllPrivateChats
 
 from app.bot import bot_command_menu, build_dispatcher
@@ -19,10 +21,13 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     logging.getLogger(__name__).info(
-        "Starting bot: workdir=%s max_tail_lines=%s max_upload_bytes=%s max_running_sessions_per_user=%s max_session_history_per_user=%s time_offset_minutes=%s log_level=%s session_db_path=%s codex_command=%s codex_artifacts_dir=%s",
+        "Starting bot: workdir=%s max_tail_lines=%s max_upload_bytes=%s telegram_api_file_limit_bytes=%s telegram_api_base_url=%s telegram_api_is_local=%s max_running_sessions_per_user=%s max_session_history_per_user=%s time_offset_minutes=%s log_level=%s session_db_path=%s codex_command=%s codex_artifacts_dir=%s",
         settings.workdir,
         settings.max_tail_lines,
         settings.max_upload_bytes,
+        settings.telegram_api_file_limit_bytes,
+        settings.telegram_api_base_url or "<default>",
+        settings.telegram_api_is_local,
         settings.max_running_sessions_per_user,
         settings.max_session_history_per_user,
         settings.time_offset_minutes,
@@ -31,7 +36,14 @@ async def main() -> None:
         settings.codex_command,
         settings.codex_artifacts_dir,
     )
-    bot = Bot(token=settings.bot_token)
+    bot_session: AiohttpSession | None = None
+    if settings.telegram_api_base_url:
+        api_server = TelegramAPIServer.from_base(
+            settings.telegram_api_base_url,
+            is_local=settings.telegram_api_is_local,
+        )
+        bot_session = AiohttpSession(api=api_server)
+    bot = Bot(token=settings.bot_token, session=bot_session)
     await bot.set_my_commands(
         bot_command_menu(),
         scope=BotCommandScopeAllPrivateChats(),

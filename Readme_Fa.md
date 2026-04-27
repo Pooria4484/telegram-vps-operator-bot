@@ -155,7 +155,10 @@ ALLOWED_USER_IDS=123456789,987654321
 DEFAULT_SHELL=/bin/bash
 WORKDIR=/home/your-user
 MAX_TAIL_LINES=30
-MAX_UPLOAD_BYTES=20971520
+MAX_UPLOAD_BYTES=1073741824
+TELEGRAM_API_BASE_URL=
+TELEGRAM_API_IS_LOCAL=0
+TELEGRAM_API_FILE_LIMIT_BYTES=20971520
 MAX_RUNNING_SESSIONS_PER_USER=3
 MAX_SESSION_HISTORY_PER_USER=20
 SESSIONS_PAGE_SIZE=5
@@ -165,6 +168,15 @@ TIME_OFFSET=+03:30
 SESSION_DB_PATH=./session_store.sqlite3
 LOG_LEVEL=INFO
 ```
+
+### واقعیت محدودیت آپلود (`MAX_UPLOAD_BYTES` در برابر Telegram API)
+
+- `MAX_UPLOAD_BYTES` فقط محدودیت داخلی خود بات است.
+- Bot API عمومی تلگرام محدودیت مستقل خودش را دارد (معمولاً خیلی کمتر از ۱ گیگ).
+- برای اینکه واقعاً آپلود بزرگ مثل ۱ گیگ کار کند، باید Local Telegram Bot API Server اجرا شود و تنظیم شود:
+  - `TELEGRAM_API_BASE_URL=http://127.0.0.1:8081`
+  - `TELEGRAM_API_IS_LOCAL=1`
+  - `TELEGRAM_API_FILE_LIMIT_BYTES=1073741824` (یا متناسب با ظرفیت Local Bot API)
 
 ### توضیح `TIME_OFFSET`
 

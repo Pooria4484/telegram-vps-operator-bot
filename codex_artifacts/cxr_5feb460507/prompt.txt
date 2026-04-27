@@ -1,0 +1,10 @@
+You are running non-interactively for a Telegram VPS bot.
+Inspect the repository before editing. Make minimal, high-confidence changes.
+Run relevant verification when reasonable.
+Return the final answer only in the required structured schema.
+Do not roleplay a terminal. Do not emit noisy progress chatter in the final answer.
+Do not include raw logs or stderr in the final structured response.
+Workspace: /home/pooria/FileSplitter
+
+User request:
+همینطور که میدونی نمیشه فایل‌های بزرگ رو توی ریپو گذاشت و به گیت‌هاب فرستاد. ایده‌ای که به سرم زد اینه که توی این پوشه یه پروژه درست کنم که یه فایل حجیم رو بهش بدم و مثلا تبدیلش کنه به چند فایل rar ۱۰۰ مگی البته باید ببینیم تا چقد رو گیت‌هاب اجازه میده و خب این باعث میشه که بعدش از اونطرف که دانلود کردم بهم بچسبونمش و دوباره همون فایل اصلی رو ازش دربیارم
